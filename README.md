@@ -10,6 +10,13 @@ institution (each gets its own `client_id` from their LMS admin):
 - **Rennix Analytics**
 - **Rennix Tutor Bot**
 
+**Status: live-tested against HTU's real Moodle.** Both tools are registered there (via
+`mod_lti`'s own `lti_add_type()`, not hand-rolled DB rows) and a real signed launch was verified
+end-to-end as `teacher1` for both. Two real bugs were caught by that test and are fixed on `main`:
+Moodle sends the OIDC login-initiation request via POST (the spec allows either GET or POST;
+only GET was implemented at first), and `req.protocol` needs `app.set('trust proxy', true')` or
+it reports `http` behind Caddy, breaking `redirect_uri` matching.
+
 ## How a launch works
 
 1. Institution's admin adds an External Tool in their LMS pointing at
