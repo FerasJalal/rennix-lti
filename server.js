@@ -94,6 +94,12 @@ function signSessionToken(payload) {
 }
 
 const app = express();
+// Behind Caddy (TLS-terminating reverse proxy) -- without this, req.protocol
+// always reports 'http' (the internal Caddy->Node hop), which corrupted the
+// redirect_uri sent to Moodle and made it reject the login (redirect_uri
+// must exactly match the https:// URL registered on the tool). Caught via
+// a real launch test against HTU's Moodle, not by inspection.
+app.set('trust proxy', true);
 app.use(cors());
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
