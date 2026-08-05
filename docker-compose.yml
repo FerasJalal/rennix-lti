@@ -1,0 +1,15 @@
+services:
+  lti:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "3002:3002"
+    environment:
+      ADMIN_SECRET: ${ADMIN_SECRET}
+      SESSION_SECRET: ${SESSION_SECRET}
+      APP_BASE_URL: ${APP_BASE_URL:-https://tutor.edu.rennix.ai}
+    volumes:
+      - lti_data:/data
+
+volumes:
+  lti_data:
