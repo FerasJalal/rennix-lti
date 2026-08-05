@@ -101,9 +101,12 @@ app.use(express.json());
 app.get('/health', (req, res) => res.json({ ok: true }));
 
 // ---- Step 1: OIDC third-party initiated login ----
-app.get('/lti/login', (req, res) => {
+// The LTI 1.3 / OIDC spec allows the platform to send this via GET or POST
+// (its choice); Moodle uses POST (a form_post autosubmit), so both must work.
+function handleLtiLogin(req, res) {
   sweepExpiredStates();
-  const { iss, login_hint, target_link_uri, client_id, lti_message_hint } = req.query;
+  const params = req.method === 'POST' ? req.body : req.query;
+  const { iss, login_hint, target_link_uri, client_id, lti_message_hint } = params;
   if (!iss || !login_hint || !target_link_uri) {
     return res.status(400).send('Missing required LTI login parameters (iss, login_hint, target_link_uri).');
   }
@@ -132,7 +135,9 @@ app.get('/lti/login', (req, res) => {
   if (lti_message_hint) authUrl.searchParams.set('lti_message_hint', String(lti_message_hint));
 
   res.redirect(302, authUrl.toString());
-});
+}
+app.get('/lti/login', handleLtiLogin);
+app.post('/lti/login', handleLtiLogin);
 
 // ---- Step 2: launch -- verify the platform's signed id_token ----
 app.post('/lti/launch', async (req, res) => {
