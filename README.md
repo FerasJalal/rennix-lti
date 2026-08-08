@@ -60,10 +60,23 @@ curl -X POST https://<this-service>/admin/platforms \
 SQLite (`better-sqlite3`), persisted via the `lti_data` Docker volume — just platform
 registrations and short-lived login state/nonces, nothing else.
 
+## How a verified launch reaches the real app
+
+A verified launch mints a signed bridge token (`LTI_BRIDGE_SECRET`, shared with tutor-service —
+separate from block_criterio's `IDENTITY_SECRET`) and redirects straight to tutor-service's real
+`/app/instructor` or `/app/home`. tutor-service is multi-tenant as of the corresponding change
+there: each institution gets its own fully isolated database, resolved only from this signed
+token, never a client-suppliable parameter. LTI's own user identifier (`sub`, an opaque
+platform-chosen string) is mapped to a stable per-tenant integer id on first launch and reused on
+every later one; first-time users are auto-provisioned from the platform's own verified
+name/email/role claims, since there's no Moodle-style manual roster sync for institutions that
+connect this way.
+
+`/lti/launched` (the old proof-of-concept identity page) is still there but no longer used by the
+real flow — harmless to keep as a debug page.
+
 ## Not yet built
 
 - Dynamic Registration (auto-onboarding instead of manual `/admin/platforms` calls)
 - Deep Linking, Names and Roles Provisioning, Assignment and Grade Services (only a basic
   resource-link launch is implemented)
-- Wiring a verified launch into the real product UI — right now it lands on a proof-of-concept
-  page showing the verified identity, not the actual app
