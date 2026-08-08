@@ -34,6 +34,9 @@ const APP_BASE_URL = process.env.APP_BASE_URL || 'https://tutor.edu.rennix.ai';
 // IDENTITY_SECRET) -- this is what lets a verified launch actually open the
 // real app instead of the proof-of-concept page.
 const LTI_BRIDGE_SECRET = process.env.LTI_BRIDGE_SECRET || '';
+// Shared with tutor-service specifically, for the one cross-service call the
+// onboarding form below makes (setting a new tenant's own OpenAI key).
+const TENANT_ADMIN_SECRET = process.env.TENANT_ADMIN_SECRET || '';
 
 if (!ADMIN_SECRET) {
   console.warn('WARNING: ADMIN_SECRET is not set -- /admin/platforms is effectively open. Set it before registering a real platform.');
@@ -334,21 +337,24 @@ app.get('/lti/jwks', async (req, res) => {
 // Registration support yet). Gate behind a shared secret; this is bootstrap
 // tooling for onboarding the first handful of institutions by hand. ----
 function requireAdmin(req, res, next) {
-  if (!ADMIN_SECRET || req.get('x-admin-secret') !== ADMIN_SECRET) {
-    return res.status(401).json({ error: 'Missing or invalid x-admin-secret header.' });
+  const provided = req.get('x-admin-secret') || req.query.secret || (req.body && req.body.secret);
+  if (!ADMIN_SECRET || provided !== ADMIN_SECRET) {
+    return res.status(401).send('Missing or invalid admin secret.');
   }
   next();
 }
 
-app.post('/admin/platforms', requireAdmin, (req, res) => {
-  const { product, tenantKey, tenantName, issuer, clientId, deploymentId, authLoginUrl, authTokenUrl, jwksUrl } = req.body;
+// Shared logic behind both the JSON API (curl/scripted onboarding) and the
+// HTML form below (a human filling in one school's details) -- one place
+// that actually writes a platform row, so they can't drift.
+function registerPlatform(fields) {
+  const { product, tenantKey, tenantName, issuer, clientId, deploymentId, authLoginUrl, authTokenUrl, jwksUrl } = fields;
   const missing = ['product', 'tenantKey', 'tenantName', 'issuer', 'clientId', 'deploymentId', 'authLoginUrl', 'jwksUrl']
-    .filter((k) => !req.body[k]);
-  if (missing.length) return res.status(400).json({ error: `Missing fields: ${missing.join(', ')}` });
+    .filter((k) => !fields[k]);
+  if (missing.length) throw new Error(`Missing fields: ${missing.join(', ')}`);
   if (!['analytics', 'tutor_bot'].includes(product)) {
-    return res.status(400).json({ error: "product must be 'analytics' or 'tutor_bot'" });
+    throw new Error("product must be 'analytics' or 'tutor_bot'");
   }
-
   db.prepare(
     `INSERT INTO platforms (product, tenant_key, tenant_name, issuer, client_id, deployment_id, auth_login_url, auth_token_url, jwks_url, created_at)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -357,12 +363,150 @@ app.post('/admin/platforms', requireAdmin, (req, res) => {
        deployment_id = excluded.deployment_id, auth_login_url = excluded.auth_login_url,
        auth_token_url = excluded.auth_token_url, jwks_url = excluded.jwks_url`
   ).run(product, tenantKey, tenantName, issuer, clientId, deploymentId, authLoginUrl, authTokenUrl || null, jwksUrl, Date.now());
+}
 
-  res.json({ ok: true });
+app.post('/admin/platforms', requireAdmin, (req, res) => {
+  try {
+    registerPlatform(req.body);
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
 });
 
 app.get('/admin/platforms', requireAdmin, (req, res) => {
   res.json(db.prepare('SELECT id, product, tenant_key, tenant_name, issuer, client_id, deployment_id, jwks_url, created_at FROM platforms').all());
+});
+
+function escapeHtml(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+  }[c]));
+}
+
+// ---- Onboarding form: a real page instead of hand-written curl commands.
+// Registers the platform(s) here (same registerPlatform() the JSON API
+// uses), then makes one HTTP call to tutor-service's own admin endpoint to
+// set the school's OpenAI key -- that setting lives on tutor-service's side
+// (per-tenant database), not here. ----
+app.get('/admin', (req, res) => {
+  const secret = String(req.query.secret || '');
+  const registered = secret && secret === ADMIN_SECRET
+    ? db.prepare('SELECT product, tenant_key, tenant_name, issuer, created_at FROM platforms ORDER BY created_at DESC').all()
+    : null;
+
+  res.set('Content-Type', 'text/html').send(`<!doctype html>
+<html><head><meta charset="utf-8"><title>Onboard a school</title>
+<style>
+  body { font-family:-apple-system,"Segoe UI",Roboto,Arial,sans-serif; background:#f7f8fa; margin:0; padding:32px 16px; }
+  .card { max-width:560px; margin:0 auto 20px; background:#fff; border:1px solid #e2e8f0; border-radius:12px; padding:24px; }
+  h1 { font-size:18px; margin:0 0 4px; }
+  p.sub { color:#57606a; font-size:13px; margin:0 0 16px; }
+  label { display:block; font-weight:700; font-size:13px; margin:14px 0 4px; }
+  input, select { width:100%; box-sizing:border-box; padding:9px 10px; border:1px solid #ccc; border-radius:6px; font-size:13px; }
+  button { margin-top:20px; padding:10px 18px; border:none; border-radius:8px; background:#d41128; color:#fff; font-weight:700; cursor:pointer; }
+  table { width:100%; border-collapse:collapse; font-size:12px; }
+  td, th { text-align:left; padding:6px 8px; border-bottom:1px solid #eef1f4; }
+  .hint { color:#8a94a6; font-size:12px; margin-top:4px; }
+  fieldset { border:1px solid #e2e8f0; border-radius:8px; margin-top:16px; padding:12px; }
+  legend { font-size:12px; font-weight:700; color:#57606a; padding:0 4px; }
+</style></head>
+<body>
+  <div class="card">
+    <h1>Onboard a school</h1>
+    <p class="sub">Registers this institution's LTI platform (so their Moodle/Canvas/Blackboard can launch the tool) and sets their own OpenAI key on tutor-service, in one submit.</p>
+    <form method="post" action="/admin/onboard">
+      <label>Admin secret</label>
+      <input name="secret" type="password" value="${escapeHtml(secret)}" required>
+
+      <label>Tenant key (slug, e.g. "htu")</label>
+      <input name="tenantKey" required pattern="[a-z0-9-]+" title="lowercase letters, numbers, hyphens only">
+      <label>Tenant name</label>
+      <input name="tenantName" placeholder="e.g. Al-Hussein Technical University" required>
+
+      <label>Product</label>
+      <select name="product">
+        <option value="tutor_bot">Rennix Tutor Bot</option>
+        <option value="analytics">Rennix Analytics</option>
+      </select>
+      <div class="hint">Each product is registered as its own External Tool in their LMS -- run this form again with the other product to enable both.</div>
+
+      <fieldset>
+        <legend>From their LMS admin's External Tool config</legend>
+        <label>Issuer</label>
+        <input name="issuer" placeholder="https://their-lms.example.edu" required>
+        <label>Client ID</label>
+        <input name="clientId" required>
+        <label>Deployment ID</label>
+        <input name="deploymentId" required>
+        <label>Auth login URL</label>
+        <input name="authLoginUrl" required>
+        <label>JWKS URL</label>
+        <input name="jwksUrl" required>
+      </fieldset>
+
+      <label>Their own OpenAI API key (optional)</label>
+      <input name="openaiApiKey" type="password" placeholder="Leave blank to use the shared default for now">
+
+      <button type="submit">Onboard</button>
+    </form>
+  </div>
+  ${registered ? `
+  <div class="card">
+    <h1>Already registered</h1>
+    <table>
+      <tr><th>Product</th><th>Tenant</th><th>Issuer</th></tr>
+      ${registered.map((p) => `<tr><td>${escapeHtml(p.product)}</td><td>${escapeHtml(p.tenant_name)} (${escapeHtml(p.tenant_key)})</td><td>${escapeHtml(p.issuer)}</td></tr>`).join('')}
+    </table>
+  </div>` : ''}
+</body></html>`);
+});
+
+app.post('/admin/onboard', requireAdmin, async (req, res) => {
+  const { tenantKey, tenantName, product, issuer, clientId, deploymentId, authLoginUrl, jwksUrl, openaiApiKey, secret } = req.body;
+
+  try {
+    registerPlatform({ product, tenantKey, tenantName, issuer, clientId, deploymentId, authLoginUrl, jwksUrl });
+  } catch (err) {
+    return res.status(400).send(`Platform registration failed: ${escapeHtml(err.message)}`);
+  }
+
+  let keyStatus = 'skipped (no key entered)';
+  if (openaiApiKey && openaiApiKey.trim()) {
+    if (!TENANT_ADMIN_SECRET) {
+      keyStatus = 'NOT set -- TENANT_ADMIN_SECRET is not configured on this service';
+    } else {
+      try {
+        const resp = await fetch(`${APP_BASE_URL}/admin/tenant-settings`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: new URLSearchParams({ secret: TENANT_ADMIN_SECRET, tenant: tenantKey, openai_api_key: openaiApiKey.trim() }),
+        });
+        keyStatus = resp.ok ? 'set successfully' : `failed (tutor-service returned ${resp.status})`;
+      } catch (err) {
+        keyStatus = `failed (${err.message})`;
+      }
+    }
+  }
+
+  res.set('Content-Type', 'text/html').send(`<!doctype html>
+<html><head><meta charset="utf-8"><title>Onboarding result</title>
+<style>body{font-family:-apple-system,"Segoe UI",Roboto,Arial,sans-serif;background:#f7f8fa;margin:0;padding:32px 16px;}
+.card{max-width:480px;margin:0 auto;background:#fff;border:1px solid #e2e8f0;border-radius:12px;padding:24px;}
+h1{font-size:18px;color:#1f9d55;margin-top:0;}
+dl{display:grid;grid-template-columns:auto 1fr;gap:6px 14px;font-size:13px;}
+dt{color:#8a94a6;font-weight:700;}dd{margin:0;}
+a{color:#d41128;}</style></head>
+<body><div class="card">
+  <h1>&#10003; Onboarded</h1>
+  <dl>
+    <dt>Tenant</dt><dd>${escapeHtml(tenantName)} (${escapeHtml(tenantKey)})</dd>
+    <dt>Product</dt><dd>${escapeHtml(product)}</dd>
+    <dt>Platform</dt><dd>registered</dd>
+    <dt>OpenAI key</dt><dd>${escapeHtml(keyStatus)}</dd>
+  </dl>
+  <p><a href="/admin?secret=${encodeURIComponent(secret)}">&larr; Back</a></p>
+</div></body></html>`);
 });
 
 app.listen(PORT, () => console.log(`rennix-lti listening on ${PORT}`));

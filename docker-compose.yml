@@ -9,6 +9,7 @@ services:
       SESSION_SECRET: ${SESSION_SECRET}
       APP_BASE_URL: ${APP_BASE_URL:-https://tutor.edu.rennix.ai}
       LTI_BRIDGE_SECRET: ${LTI_BRIDGE_SECRET}
+      TENANT_ADMIN_SECRET: ${TENANT_ADMIN_SECRET}
     volumes:
       - lti_data:/data
 
