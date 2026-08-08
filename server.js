@@ -30,6 +30,10 @@ const SESSION_SECRET = process.env.SESSION_SECRET || crypto.randomBytes(32).toSt
 // tutor-service for now (single shared app across tenants); swap per-tenant
 // once the multi-tenant app itself exists.
 const APP_BASE_URL = process.env.APP_BASE_URL || 'https://tutor.edu.rennix.ai';
+// Shared with tutor-service specifically (separate from block_criterio's
+// IDENTITY_SECRET) -- this is what lets a verified launch actually open the
+// real app instead of the proof-of-concept page.
+const LTI_BRIDGE_SECRET = process.env.LTI_BRIDGE_SECRET || '';
 
 if (!ADMIN_SECRET) {
   console.warn('WARNING: ADMIN_SECRET is not set -- /admin/platforms is effectively open. Set it before registering a real platform.');
@@ -68,7 +72,57 @@ db.exec(`
     target_link_uri TEXT,
     created_at INTEGER NOT NULL
   );
+  CREATE TABLE IF NOT EXISTS lti_user_map (
+    tenant_key TEXT NOT NULL,
+    platform_issuer TEXT NOT NULL,
+    subject TEXT NOT NULL,
+    userid INTEGER NOT NULL,
+    PRIMARY KEY (tenant_key, platform_issuer, subject)
+  );
+  CREATE TABLE IF NOT EXISTS tenant_userid_seq (
+    tenant_key TEXT PRIMARY KEY,
+    next_userid INTEGER NOT NULL
+  );
 `);
+
+// tutor-service's schema keys students by a small integer id (it grew up as
+// a single Moodle-backed pilot, where that's just Moodle's own user id).
+// LTI's own user identifier (the `sub` claim) is an opaque, platform-chosen
+// string with no such guarantee -- so this is the one place that identity
+// gets translated into a stable integer, scoped per tenant, allocated once
+// and reused on every later launch by the same person. The 100000 starting
+// point keeps LTI-issued ids from ever colliding with any small id a tenant
+// might already have from manual/legacy seeding (as HTU's does).
+function getOrAllocateUserId(tenantKey, issuer, subject) {
+  const existing = db.prepare(
+    'SELECT userid FROM lti_user_map WHERE tenant_key = ? AND platform_issuer = ? AND subject = ?'
+  ).get(tenantKey, issuer, subject);
+  if (existing) return existing.userid;
+
+  const allocate = db.transaction(() => {
+    let seq = db.prepare('SELECT next_userid FROM tenant_userid_seq WHERE tenant_key = ?').get(tenantKey);
+    if (!seq) {
+      seq = { next_userid: 100000 };
+      db.prepare('INSERT INTO tenant_userid_seq (tenant_key, next_userid) VALUES (?, ?)').run(tenantKey, seq.next_userid);
+    }
+    db.prepare('UPDATE tenant_userid_seq SET next_userid = next_userid + 1 WHERE tenant_key = ?').run(tenantKey);
+    db.prepare(
+      'INSERT INTO lti_user_map (tenant_key, platform_issuer, subject, userid) VALUES (?, ?, ?, ?)'
+    ).run(tenantKey, issuer, subject, seq.next_userid);
+    return seq.next_userid;
+  });
+  return allocate();
+}
+
+// The token tutor-service actually trusts to open the real app -- distinct
+// from signSessionToken below, which is this service's own internal-only
+// token for the proof-of-concept landing page.
+function signBridgeToken(payload) {
+  if (!LTI_BRIDGE_SECRET) throw new Error('LTI_BRIDGE_SECRET is not set');
+  const body = Buffer.from(JSON.stringify({ ...payload, exp: Date.now() + 8 * 60 * 60 * 1000 })).toString('base64url');
+  const sig = crypto.createHmac('sha256', LTI_BRIDGE_SECRET).update(body).digest('base64url');
+  return `${body}.${sig}`;
+}
 
 // States/nonces are single-use and short-lived (10 min) -- sweep expired
 // rows on every login attempt rather than running a separate cron.
@@ -195,13 +249,23 @@ app.post('/lti/launch', async (req, res) => {
       resourceLinkId: resourceLink.id || null,
     };
 
-    const sessionToken = signSessionToken(identity);
-    // Hand off into the actual product. For this MVP, land on a page that
-    // proves the verified identity round-tripped correctly; wiring this into
-    // tutor-service's real student/instructor app is the next step once the
-    // multi-tenant schema exists there to receive it.
-    const dest = new URL('/lti/launched', `${req.protocol}://${req.get('host')}`);
-    dest.searchParams.set('session', sessionToken);
+    // Hand off into the actual product now that tutor-service has a
+    // multi-tenant schema to receive it: mint the signed bridge token it
+    // trusts, and land straight on the real instructor/student app for
+    // this person's own tenant -- the same pages block_criterio's Moodle
+    // handoff opens, just reached through a different, cross-platform door.
+    const userid = getOrAllocateUserId(platform.tenant_key, platform.issuer, payload.sub);
+    const role = isInstructor ? 'course_supervisor' : 'student';
+    const bridgeToken = signBridgeToken({
+      tenant: platform.tenant_key,
+      userid,
+      role,
+      fullname: identity.name,
+      email: identity.email,
+    });
+
+    const dest = new URL(isInstructor ? '/app/instructor' : '/app/home', APP_BASE_URL);
+    dest.searchParams.set('t', bridgeToken);
     res.redirect(303, dest.toString());
   } catch (err) {
     console.error('[LTI launch] verification failed:', err.message);
