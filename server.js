@@ -94,13 +94,47 @@ db.exec(`
 // string with no such guarantee -- so this is the one place that identity
 // gets translated into a stable integer, scoped per tenant, allocated once
 // and reused on every later launch by the same person. The 100000 starting
-// point keeps LTI-issued ids from ever colliding with any small id a tenant
-// might already have from manual/legacy seeding (as HTU's does).
-function getOrAllocateUserId(tenantKey, issuer, subject) {
+// point keeps freshly-allocated ids from ever colliding with any small id a
+// tenant might already have from manual/legacy seeding.
+//
+// Before allocating fresh, this checks tutor-service for an existing student
+// with the same email in this tenant -- essential for HTU specifically,
+// which already has real students with real history (attendance, chat,
+// notes) under small ids from the Moodle-plugin path; without this, the same
+// person launching via LTI instead would silently become a second,
+// historyless account. A tenant that only ever arrives via LTI never has a
+// pre-existing row to match, so this is a no-op cost for it -- just
+// allocating fresh, as before.
+async function findExistingUserIdByEmail(tenantKey, email) {
+  if (!email || !TENANT_ADMIN_SECRET) return null;
+  try {
+    const url = new URL('/admin/tenant-user-lookup', APP_BASE_URL);
+    url.searchParams.set('secret', TENANT_ADMIN_SECRET);
+    url.searchParams.set('tenant', tenantKey);
+    url.searchParams.set('email', email);
+    const resp = await fetch(url.toString());
+    if (!resp.ok) return null;
+    const data = await resp.json();
+    return data.userid || null;
+  } catch (err) {
+    console.error('[LTI] existing-user lookup failed:', err.message);
+    return null;
+  }
+}
+
+async function getOrAllocateUserId(tenantKey, issuer, subject, email) {
   const existing = db.prepare(
     'SELECT userid FROM lti_user_map WHERE tenant_key = ? AND platform_issuer = ? AND subject = ?'
   ).get(tenantKey, issuer, subject);
   if (existing) return existing.userid;
+
+  const matched = await findExistingUserIdByEmail(tenantKey, email);
+  if (matched) {
+    db.prepare(
+      'INSERT INTO lti_user_map (tenant_key, platform_issuer, subject, userid) VALUES (?, ?, ?, ?)'
+    ).run(tenantKey, issuer, subject, matched);
+    return matched;
+  }
 
   const allocate = db.transaction(() => {
     let seq = db.prepare('SELECT next_userid FROM tenant_userid_seq WHERE tenant_key = ?').get(tenantKey);
@@ -257,7 +291,7 @@ app.post('/lti/launch', async (req, res) => {
     // trusts, and land straight on the real instructor/student app for
     // this person's own tenant -- the same pages block_criterio's Moodle
     // handoff opens, just reached through a different, cross-platform door.
-    const userid = getOrAllocateUserId(platform.tenant_key, platform.issuer, payload.sub);
+    const userid = await getOrAllocateUserId(platform.tenant_key, platform.issuer, payload.sub, identity.email);
     const role = isInstructor ? 'course_supervisor' : 'student';
     const bridgeToken = signBridgeToken({
       tenant: platform.tenant_key,
