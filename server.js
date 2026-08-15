@@ -299,6 +299,12 @@ app.post('/lti/launch', async (req, res) => {
       role,
       fullname: identity.name,
       email: identity.email,
+      // Which of the two independently-registered External Tools this
+      // launch came through -- 'analytics' vs 'tutor_bot'. tutor-service
+      // uses this to show only what that product actually includes (an
+      // "analytics"-only launch never sees the chat/quiz-authoring tools
+      // that belong to the separate "tutor_bot" product).
+      product: platform.product,
     });
 
     const dest = new URL(isInstructor ? '/app/instructor' : '/app/home', APP_BASE_URL);
