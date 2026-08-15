@@ -286,6 +286,29 @@ app.post('/lti/launch', async (req, res) => {
       resourceLinkId: resourceLink.id || null,
     };
 
+    // "Rennix Analytics" is an instructor-only product -- a student
+    // launching it should see that plainly, not silently land on the
+    // generic student home page as if they'd launched the (student-facing)
+    // Tutor Bot instead. That would make Analytics look like it has no real
+    // boundary at all, which defeats the point of it being sold as its own
+    // separate, instructor-only tool.
+    if (platform.product === 'analytics' && !isInstructor) {
+      return res.set('Content-Type', 'text/html').status(403).send(`<!doctype html>
+<html><head><meta charset="utf-8"><title>Instructor access only</title>
+<style>
+  body { font-family: -apple-system, "Segoe UI", Roboto, Arial, sans-serif; background:#f7f8fa; margin:0; padding:40px; }
+  .card { max-width:440px; margin:0 auto; background:#fff; border:1px solid #e2e8f0; border-radius:12px; padding:28px; text-align:center; }
+  h1 { font-size:17px; margin:0 0 8px; color:#1a1a1a; }
+  p { color:#57606a; font-size:13px; line-height:1.6; margin:0; }
+</style></head>
+<body>
+  <div class="card">
+    <h1>Instructor access only</h1>
+    <p>Rennix Analytics is an instructor tool. Your account (${escapeHtml(identity.name)}) is signed in as a student in this course, so there's nothing to show here.</p>
+  </div>
+</body></html>`);
+    }
+
     // Hand off into the actual product now that tutor-service has a
     // multi-tenant schema to receive it: mint the signed bridge token it
     // trusts, and land straight on the real instructor/student app for
