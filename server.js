@@ -359,15 +359,18 @@ app.post('/lti/launch', rateLimit('lti-launch', 30, 60 * 1000), async (req, res)
     });
 
     if (payload.nonce !== stateRow.nonce) {
+      logAdminEvent('lti_nonce_mismatch', `platform_id=${platform.id} tenant=${platform.tenant_key}`, req);
       return res.status(400).send('Nonce mismatch -- possible replay, rejecting launch.');
     }
     const messageType = payload['https://purl.imsglobal.org/spec/lti/claim/message_type'];
     const ltiVersion = payload['https://purl.imsglobal.org/spec/lti/claim/version'];
     const deploymentId = payload['https://purl.imsglobal.org/spec/lti/claim/deployment_id'];
     if (messageType !== 'LtiResourceLinkRequest' || ltiVersion !== '1.3.0') {
+      logAdminEvent('lti_unsupported_message', `type=${messageType} version=${ltiVersion} platform_id=${platform.id}`, req);
       return res.status(400).send(`Unsupported LTI message (type=${messageType}, version=${ltiVersion}).`);
     }
     if (deploymentId !== platform.deployment_id) {
+      logAdminEvent('lti_deployment_mismatch', `platform_id=${platform.id} tenant=${platform.tenant_key}`, req);
       return res.status(400).send('Deployment ID does not match this platform\'s registration.');
     }
 
@@ -397,6 +400,7 @@ app.post('/lti/launch', rateLimit('lti-launch', 30, 60 * 1000), async (req, res)
     // boundary at all, which defeats the point of it being sold as its own
     // separate, instructor-only tool.
     if (platform.product === 'analytics' && !isInstructor) {
+      logAdminEvent('lti_analytics_blocked_student', `tenant=${platform.tenant_key}`, req);
       return res.set('Content-Type', 'text/html').status(403).send(`<!doctype html>
 <html><head><meta charset="utf-8"><title>Instructor access only</title>
 <style>
@@ -434,10 +438,14 @@ app.post('/lti/launch', rateLimit('lti-launch', 30, 60 * 1000), async (req, res)
       product: platform.product,
     });
 
+    logAdminEvent('lti_launch_success', `tenant=${platform.tenant_key} product=${platform.product} role=${role}`, req);
     const dest = new URL(isInstructor ? '/app/instructor' : '/app/home', APP_BASE_URL);
     dest.searchParams.set('t', bridgeToken);
     res.redirect(303, dest.toString());
   } catch (err) {
+    // err.message only -- never the id_token itself, which is the platform's
+    // signed credential for this user, not something to persist in a log.
+    logAdminEvent('lti_jwt_verification_failed', err.message, req);
     console.error('[LTI launch] verification failed:', err.message);
     res.status(400).send(`Launch verification failed: ${err.message}`);
   }
