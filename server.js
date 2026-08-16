@@ -126,10 +126,11 @@ async function findExistingUserIdByEmail(tenantKey, email) {
   if (!email || !TENANT_ADMIN_SECRET) return null;
   try {
     const url = new URL('/admin/tenant-user-lookup', APP_BASE_URL);
-    url.searchParams.set('secret', TENANT_ADMIN_SECRET);
     url.searchParams.set('tenant', tenantKey);
     url.searchParams.set('email', email);
-    const resp = await fetch(url.toString());
+    // Header, not a query param -- tutor-service's requireTenantAdmin no longer
+    // accepts the secret via the URL (it would land in access/proxy logs).
+    const resp = await fetch(url.toString(), { headers: { 'x-tenant-admin-secret': TENANT_ADMIN_SECRET } });
     if (!resp.ok) return null;
     const data = await resp.json();
     return data.userid || null;
@@ -671,8 +672,8 @@ app.post('/admin/onboard', requireAdmin, async (req, res) => {
       try {
         const resp = await fetch(`${APP_BASE_URL}/admin/tenant-settings`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-          body: new URLSearchParams({ secret: TENANT_ADMIN_SECRET, tenant: tenantKey, openai_api_key: openaiApiKey.trim() }),
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'x-tenant-admin-secret': TENANT_ADMIN_SECRET },
+          body: new URLSearchParams({ tenant: tenantKey, openai_api_key: openaiApiKey.trim() }),
         });
         keyStatus = resp.ok ? 'set successfully' : `failed (tutor-service returned ${resp.status})`;
       } catch (err) {
