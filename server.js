@@ -261,6 +261,31 @@ function parseCookies(header) {
   return out;
 }
 
+// ---- Rate limiting ----
+// Per-process, in-memory sliding window keyed by IP + endpoint name. Fine for a
+// single instance; becomes inaccurate across multiple replicas behind a load
+// balancer -- same caveat as the state/nonce store, both move to a shared store
+// (Redis) together if this ever runs multi-replica. Hand-rolled rather than a
+// dependency to match how the rest of this file already does rate limiting
+// (see tutor-service's checkAndRecordRateLimit, same idea against SQLite).
+const rateLimitBuckets = new Map(); // "name:ip" -> timestamps[]
+function isRateLimited(key, maxRequests, windowMs) {
+  const now = Date.now();
+  const bucket = (rateLimitBuckets.get(key) || []).filter((t) => now - t < windowMs);
+  bucket.push(now);
+  rateLimitBuckets.set(key, bucket);
+  return bucket.length > maxRequests;
+}
+function rateLimit(name, maxRequests, windowMs) {
+  return (req, res, next) => {
+    const ip = (req.get('x-forwarded-for') || req.socket.remoteAddress || 'unknown').split(',')[0].trim();
+    if (isRateLimited(`${name}:${ip}`, maxRequests, windowMs)) {
+      return res.status(429).send('Too many requests. Try again shortly.');
+    }
+    next();
+  };
+}
+
 const app = express();
 // Behind Caddy (TLS-terminating reverse proxy) -- without this, req.protocol
 // always reports 'http' (the internal Caddy->Node hop), which corrupted the
@@ -310,11 +335,12 @@ function handleLtiLogin(req, res) {
 
   res.redirect(302, authUrl.toString());
 }
-app.get('/lti/login', handleLtiLogin);
-app.post('/lti/login', handleLtiLogin);
+const ltiEntryRateLimit = rateLimit('lti-login', 30, 60 * 1000);
+app.get('/lti/login', ltiEntryRateLimit, handleLtiLogin);
+app.post('/lti/login', ltiEntryRateLimit, handleLtiLogin);
 
 // ---- Step 2: launch -- verify the platform's signed id_token ----
-app.post('/lti/launch', async (req, res) => {
+app.post('/lti/launch', rateLimit('lti-launch', 30, 60 * 1000), async (req, res) => {
   try {
     const { id_token, state } = req.body;
     if (!id_token || !state) return res.status(400).send('Missing id_token or state.');
@@ -518,7 +544,7 @@ app.get('/admin/login', (req, res) => {
 </body></html>`);
 });
 
-app.post('/admin/login', (req, res) => {
+app.post('/admin/login', rateLimit('admin-login', 5, 15 * 60 * 1000), (req, res) => {
   const provided = req.body && req.body.secret;
   if (!ADMIN_SECRET || provided !== ADMIN_SECRET) {
     logAdminEvent('admin_login_failed', null, req);
