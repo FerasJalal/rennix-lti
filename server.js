@@ -195,6 +195,28 @@ function getPlatform({ issuer, clientId }) {
 // Our own signing key, for the compact session token we hand to the app
 // after a verified launch (HMAC is enough here -- this token never leaves
 // our own infrastructure, unlike the platform's id_token which does).
+// ---- LTI role -> internal role mapping ----
+// LTI 1.3 roles are full IMS vocabulary URNs (context roles such as
+// .../membership#Instructor, or system roles such as .../system/person#Administrator),
+// not free text. Matching them precisely -- instead of the old blanket
+// /Instructor|ContentDeveloper|Administrator/i regex, which collapsed every one of
+// those into a single "instructor" bucket with identical rights -- is what lets
+// different LTI roles carry different actual permissions. Two instructor-tier
+// roles already exist on tutor-service's side: 'course_supervisor' (full rights,
+// including the Verification queue) and 'section_instructor' (content/analytics
+// access, no verification authority). This is where that split gets decided, not
+// left implicit at each call site.
+const LTI_ROLE_SUPERVISOR_SUFFIXES = ['membership#Instructor', 'system/person#Administrator', 'institution/person#Administrator'];
+const LTI_ROLE_SECTION_INSTRUCTOR_SUFFIXES = ['membership#ContentDeveloper', 'membership#TeachingAssistant'];
+function mapLtiRolesToInternalRole(ltiRoles) {
+  const roles = ltiRoles || [];
+  if (roles.some((r) => LTI_ROLE_SUPERVISOR_SUFFIXES.some((suffix) => r.endsWith(suffix)))) return 'course_supervisor';
+  // TeachingAssistant previously matched nothing in the old regex and silently fell
+  // through to 'student' -- a TA launching the tool got no instructor tooling at all.
+  if (roles.some((r) => LTI_ROLE_SECTION_INSTRUCTOR_SUFFIXES.some((suffix) => r.endsWith(suffix)))) return 'section_instructor';
+  return 'student';
+}
+
 function signSessionToken(payload) {
   const body = Buffer.from(JSON.stringify({ ...payload, iat: Date.now() })).toString('base64url');
   const sig = crypto.createHmac('sha256', SESSION_SECRET).update(body).digest('base64url');
@@ -323,7 +345,8 @@ app.post('/lti/launch', async (req, res) => {
     }
 
     const roles = payload['https://purl.imsglobal.org/spec/lti/claim/roles'] || [];
-    const isInstructor = roles.some((r) => /Instructor|ContentDeveloper|Administrator/i.test(r));
+    const internalRole = mapLtiRolesToInternalRole(roles);
+    const isInstructor = internalRole !== 'student';
     const context = payload['https://purl.imsglobal.org/spec/lti/claim/context'] || {};
     const resourceLink = payload['https://purl.imsglobal.org/spec/lti/claim/resource_link'] || {};
 
@@ -369,7 +392,7 @@ app.post('/lti/launch', async (req, res) => {
     // this person's own tenant -- the same pages block_criterio's Moodle
     // handoff opens, just reached through a different, cross-platform door.
     const userid = await getOrAllocateUserId(platform.tenant_key, platform.issuer, payload.sub, identity.email);
-    const role = isInstructor ? 'course_supervisor' : 'student';
+    const role = internalRole;
     const bridgeToken = signBridgeToken({
       tenant: platform.tenant_key,
       userid,
