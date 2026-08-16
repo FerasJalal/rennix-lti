@@ -86,7 +86,24 @@ db.exec(`
     tenant_key TEXT PRIMARY KEY,
     next_userid INTEGER NOT NULL
   );
+  CREATE TABLE IF NOT EXISTS admin_audit_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event TEXT NOT NULL,
+    detail TEXT,
+    ip TEXT,
+    created_at INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_audit_created ON admin_audit_log(created_at);
 `);
+
+// Never pass raw secrets, tokens, or full request bodies into `detail` --
+// this table exists to answer "who did what, when", not to reconstruct
+// credentials from logs.
+function logAdminEvent(event, detail, req) {
+  const ip = req ? (req.get('x-forwarded-for') || req.socket?.remoteAddress || '') : '';
+  db.prepare('INSERT INTO admin_audit_log (event, detail, ip, created_at) VALUES (?, ?, ?, ?)')
+    .run(event, detail || null, String(ip).split(',')[0].trim(), Date.now());
+}
 
 // tutor-service's schema keys students by a small integer id (it grew up as
 // a single Moodle-backed pilot, where that's just Moodle's own user id).
@@ -182,6 +199,43 @@ function signSessionToken(payload) {
   const body = Buffer.from(JSON.stringify({ ...payload, iat: Date.now() })).toString('base64url');
   const sig = crypto.createHmac('sha256', SESSION_SECRET).update(body).digest('base64url');
   return `${body}.${sig}`;
+}
+
+// ---- Admin session cookie -- replaces passing ADMIN_SECRET around in query
+// strings/POST bodies on every request. A human logs in once (POST
+// /admin/login, secret in the body only, never the URL), gets a signed,
+// HttpOnly, short-lived cookie back, and that carries them from then on.
+// x-admin-secret header auth stays available separately for scripted/API use
+// (curl, CI), where a header doesn't end up in browser history or Referer
+// headers the way a query string does. ----
+const ADMIN_SESSION_MAX_AGE_MS = 12 * 60 * 60 * 1000;
+
+function signAdminSession() {
+  const body = Buffer.from(JSON.stringify({ type: 'admin', exp: Date.now() + ADMIN_SESSION_MAX_AGE_MS })).toString('base64url');
+  const sig = crypto.createHmac('sha256', SESSION_SECRET).update(body).digest('base64url');
+  return `${body}.${sig}`;
+}
+
+function verifyAdminSession(token) {
+  if (!token || typeof token !== 'string') return false;
+  const [body, sig] = token.split('.');
+  if (!body || !sig) return false;
+  const expectedSig = crypto.createHmac('sha256', SESSION_SECRET).update(body).digest('base64url');
+  const a = Buffer.from(sig), b = Buffer.from(expectedSig);
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return false;
+  let parsed;
+  try { parsed = JSON.parse(Buffer.from(body, 'base64url').toString()); } catch (e) { return false; }
+  return parsed.type === 'admin' && typeof parsed.exp === 'number' && parsed.exp > Date.now();
+}
+
+function parseCookies(header) {
+  const out = {};
+  String(header || '').split(';').forEach((part) => {
+    const idx = part.indexOf('=');
+    if (idx === -1) return;
+    out[part.slice(0, idx).trim()] = decodeURIComponent(part.slice(idx + 1).trim());
+  });
+  return out;
 }
 
 const app = express();
@@ -397,15 +451,66 @@ app.get('/lti/jwks', async (req, res) => {
 });
 
 // ---- Admin: register a platform (manual registration -- no Dynamic
-// Registration support yet). Gate behind a shared secret; this is bootstrap
-// tooling for onboarding the first handful of institutions by hand. ----
+// Registration support yet). Two ways in: a browser-facing session cookie
+// (see /admin/login below) for humans, or the x-admin-secret header for
+// scripted/API callers. Deliberately does NOT accept the secret from
+// req.query or req.body anymore -- a query string ends up in browser
+// history, proxy/access logs, and Referer headers; a POST body posted over
+// TLS is safer but still means re-sending the secret on every single call
+// instead of authenticating once. ----
 function requireAdmin(req, res, next) {
-  const provided = req.get('x-admin-secret') || req.query.secret || (req.body && req.body.secret);
-  if (!ADMIN_SECRET || provided !== ADMIN_SECRET) {
-    return res.status(401).send('Missing or invalid admin secret.');
-  }
-  next();
+  const headerSecret = req.get('x-admin-secret');
+  if (ADMIN_SECRET && headerSecret && headerSecret === ADMIN_SECRET) return next();
+  const cookies = parseCookies(req.headers.cookie);
+  if (verifyAdminSession(cookies.admin_session)) return next();
+  if (req.method === 'GET' && req.accepts('html')) return res.redirect('/admin/login');
+  return res.status(401).json({ error: 'Missing or invalid admin credentials.' });
 }
+
+app.get('/admin/login', (req, res) => {
+  const cookies = parseCookies(req.headers.cookie);
+  if (verifyAdminSession(cookies.admin_session)) return res.redirect('/admin');
+  res.set('Content-Type', 'text/html').send(`<!doctype html>
+<html><head><meta charset="utf-8"><title>Admin sign-in</title>
+<style>
+  body { font-family:-apple-system,"Segoe UI",Roboto,Arial,sans-serif; background:#f7f8fa; margin:0; padding:80px 16px; }
+  .card { max-width:360px; margin:0 auto; background:#fff; border:1px solid #e2e8f0; border-radius:12px; padding:24px; }
+  h1 { font-size:18px; margin:0 0 16px; }
+  label { display:block; font-weight:700; font-size:13px; margin:0 0 6px; }
+  input { width:100%; box-sizing:border-box; padding:9px 10px; border:1px solid #ccc; border-radius:6px; font-size:13px; }
+  button { margin-top:16px; width:100%; padding:10px 18px; border:none; border-radius:8px; background:#d41128; color:#fff; font-weight:700; cursor:pointer; }
+  .err { color:#a10f22; font-size:13px; margin-top:10px; }
+</style></head>
+<body>
+  <div class="card">
+    <h1>Admin sign-in</h1>
+    <form method="post" action="/admin/login">
+      <label>Admin secret</label>
+      <input name="secret" type="password" required autofocus>
+      <button type="submit">Sign in</button>
+    </form>
+    ${req.query.error ? '<div class="err">Invalid secret.</div>' : ''}
+  </div>
+</body></html>`);
+});
+
+app.post('/admin/login', (req, res) => {
+  const provided = req.body && req.body.secret;
+  if (!ADMIN_SECRET || provided !== ADMIN_SECRET) {
+    logAdminEvent('admin_login_failed', null, req);
+    return res.redirect('/admin/login?error=1');
+  }
+  logAdminEvent('admin_login_success', null, req);
+  res.cookie('admin_session', signAdminSession(), {
+    httpOnly: true, secure: true, sameSite: 'strict', maxAge: ADMIN_SESSION_MAX_AGE_MS,
+  });
+  res.redirect('/admin');
+});
+
+app.post('/admin/logout', (req, res) => {
+  res.clearCookie('admin_session');
+  res.redirect('/admin/login');
+});
 
 // Shared logic behind both the JSON API (curl/scripted onboarding) and the
 // HTML form below (a human filling in one school's details) -- one place
@@ -431,6 +536,7 @@ function registerPlatform(fields) {
 app.post('/admin/platforms', requireAdmin, (req, res) => {
   try {
     registerPlatform(req.body);
+    logAdminEvent('platform_registered', `${req.body.product} / ${req.body.tenantKey}`, req);
     res.json({ ok: true });
   } catch (err) {
     res.status(400).json({ error: err.message });
@@ -453,10 +559,9 @@ function escapeHtml(s) {
 // set the school's OpenAI key -- that setting lives on tutor-service's side
 // (per-tenant database), not here. ----
 app.get('/admin', (req, res) => {
-  const secret = String(req.query.secret || '');
-  const registered = secret && secret === ADMIN_SECRET
-    ? db.prepare('SELECT product, tenant_key, tenant_name, issuer, created_at FROM platforms ORDER BY created_at DESC').all()
-    : null;
+  const cookies = parseCookies(req.headers.cookie);
+  if (!verifyAdminSession(cookies.admin_session)) return res.redirect('/admin/login');
+  const registered = db.prepare('SELECT product, tenant_key, tenant_name, issuer, created_at FROM platforms ORDER BY created_at DESC').all();
 
   res.set('Content-Type', 'text/html').send(`<!doctype html>
 <html><head><meta charset="utf-8"><title>Onboard a school</title>
@@ -473,15 +578,15 @@ app.get('/admin', (req, res) => {
   .hint { color:#8a94a6; font-size:12px; margin-top:4px; }
   fieldset { border:1px solid #e2e8f0; border-radius:8px; margin-top:16px; padding:12px; }
   legend { font-size:12px; font-weight:700; color:#57606a; padding:0 4px; }
+  .signout { text-align:right; max-width:560px; margin:0 auto 8px; }
+  .signout button { background:none; border:none; color:#8a94a6; font-size:12px; cursor:pointer; text-decoration:underline; padding:0; margin:0; }
 </style></head>
 <body>
+  <div class="signout"><form method="post" action="/admin/logout"><button type="submit">Sign out</button></form></div>
   <div class="card">
     <h1>Onboard a school</h1>
     <p class="sub">Registers this institution's LTI platform (so their Moodle/Canvas/Blackboard can launch the tool) and sets their own OpenAI key on tutor-service, in one submit.</p>
     <form method="post" action="/admin/onboard">
-      <label>Admin secret</label>
-      <input name="secret" type="password" value="${escapeHtml(secret)}" required>
-
       <label>Tenant key (slug, e.g. "htu")</label>
       <input name="tenantKey" required pattern="[a-z0-9-]+" title="lowercase letters, numbers, hyphens only">
       <label>Tenant name</label>
@@ -514,7 +619,7 @@ app.get('/admin', (req, res) => {
       <button type="submit">Onboard</button>
     </form>
   </div>
-  ${registered ? `
+  ${registered.length ? `
   <div class="card">
     <h1>Already registered</h1>
     <table>
@@ -526,10 +631,11 @@ app.get('/admin', (req, res) => {
 });
 
 app.post('/admin/onboard', requireAdmin, async (req, res) => {
-  const { tenantKey, tenantName, product, issuer, clientId, deploymentId, authLoginUrl, jwksUrl, openaiApiKey, secret } = req.body;
+  const { tenantKey, tenantName, product, issuer, clientId, deploymentId, authLoginUrl, jwksUrl, openaiApiKey } = req.body;
 
   try {
     registerPlatform({ product, tenantKey, tenantName, issuer, clientId, deploymentId, authLoginUrl, jwksUrl });
+    logAdminEvent('platform_onboarded', `${product} / ${tenantKey}`, req);
   } catch (err) {
     return res.status(400).send(`Platform registration failed: ${escapeHtml(err.message)}`);
   }
@@ -568,7 +674,7 @@ a{color:#d41128;}</style></head>
     <dt>Platform</dt><dd>registered</dd>
     <dt>OpenAI key</dt><dd>${escapeHtml(keyStatus)}</dd>
   </dl>
-  <p><a href="/admin?secret=${encodeURIComponent(secret)}">&larr; Back</a></p>
+  <p><a href="/admin">&larr; Back</a></p>
 </div></body></html>`);
 });
 
