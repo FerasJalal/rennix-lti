@@ -20,7 +20,7 @@ const cors = require('cors');
 const path = require('path');
 const crypto = require('crypto');
 const Database = require('better-sqlite3');
-const { createRemoteJWKSet, jwtVerify, SignJWT, generateKeyPair, exportJWK } = require('jose');
+const { createRemoteJWKSet, jwtVerify, SignJWT, generateKeyPair, exportJWK, importPKCS8, exportPKCS8 } = require('jose');
 
 const PORT = process.env.PORT || 3002;
 const DB_PATH = process.env.DB_PATH || path.join(__dirname, 'data', 'lti.db');
@@ -85,6 +85,12 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS tenant_userid_seq (
     tenant_key TEXT PRIMARY KEY,
     next_userid INTEGER NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS tool_keys (
+    kid TEXT PRIMARY KEY,
+    private_key_pem TEXT NOT NULL,
+    public_jwk TEXT NOT NULL,
+    created_at INTEGER NOT NULL
   );
   CREATE TABLE IF NOT EXISTS admin_audit_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -438,10 +444,22 @@ app.post('/lti/launch', rateLimit('lti-launch', 30, 60 * 1000), async (req, res)
       product: platform.product,
     });
 
-    logAdminEvent('lti_launch_success', `tenant=${platform.tenant_key} product=${platform.product} role=${role}`, req);
+    const nrpsClaim = payload['https://purl.imsglobal.org/spec/lti-nrps/claim/namesroleservice'];
+    logAdminEvent('lti_launch_success', `tenant=${platform.tenant_key} product=${platform.product} role=${role} nrps=${nrpsClaim ? 'yes' : 'no'}`, req);
     const dest = new URL(isInstructor ? '/app/instructor' : '/app/home', APP_BASE_URL);
     dest.searchParams.set('t', bridgeToken);
     res.redirect(303, dest.toString());
+
+    // Fire-and-forget: never delay the user's redirect on a roster sync. Only
+    // instructor-tier launches trigger it -- a student's own launch has no
+    // more course-membership visibility than what NRPS already grants any
+    // launch, but there's no reason to fetch+push the whole roster on every
+    // single student click when one instructor launch a day covers it.
+    if (nrpsClaim && nrpsClaim.context_memberships_url && isInstructor) {
+      syncRosterViaNrps(platform, nrpsClaim.context_memberships_url).catch((err) => {
+        logAdminEvent('nrps_sync_failed', `tenant=${platform.tenant_key} error=${err.message}`.slice(0, 500), null);
+      });
+    }
   } catch (err) {
     // err.message only -- never the id_token itself, which is the platform's
     // signed credential for this user, not something to persist in a log.
@@ -489,24 +507,151 @@ app.get('/lti/launched', (req, res) => {
 </body></html>`);
 });
 
-// ---- Our own JWKS (forward-compatible: not required for a pure resource-link
-// launch, but most registration flows expect a tool to publish one, and it's
-// needed the moment we add signed service calls back into the platform) ----
-let toolJwkCache = null;
-async function getToolJwk() {
-  if (toolJwkCache) return toolJwkCache;
-  const { publicKey } = await generateKeyPair('RS256');
+// ---- Our own key pair ----
+// This used to regenerate a random key pair on every call and only ever kept
+// the public half -- which meant /lti/jwks changed on every restart (breaking
+// any platform's cached copy of it) and there was no private key anywhere to
+// actually sign anything with. Needed for real now: NRPS/AGS service calls
+// require this tool to sign its own JWT client assertions, which means the
+// key pair has to be stable across restarts, not regenerated each time.
+// Persisted in this service's own database (same trust boundary as every
+// other secret this service already holds -- ADMIN_SECRET, LTI_BRIDGE_SECRET
+// -- none of which are encrypted at rest either).
+let toolKeyPairCache = null; // { privateKey: CryptoKey, publicJwk, kid }
+async function getToolKeyPair() {
+  if (toolKeyPairCache) return toolKeyPairCache;
+  const row = db.prepare('SELECT * FROM tool_keys ORDER BY created_at ASC LIMIT 1').get();
+  if (row) {
+    const privateKey = await importPKCS8(row.private_key_pem, 'RS256');
+    toolKeyPairCache = { privateKey, publicJwk: JSON.parse(row.public_jwk), kid: row.kid };
+    return toolKeyPairCache;
+  }
+  const { publicKey, privateKey } = await generateKeyPair('RS256', { extractable: true });
+  const kid = 'rennix-lti-' + crypto.randomBytes(4).toString('hex');
   const jwk = await exportJWK(publicKey);
   jwk.alg = 'RS256';
   jwk.use = 'sig';
-  jwk.kid = 'rennix-lti-1';
-  toolJwkCache = jwk;
-  return jwk;
+  jwk.kid = kid;
+  const pem = await exportPKCS8(privateKey);
+  db.prepare('INSERT INTO tool_keys (kid, private_key_pem, public_jwk, created_at) VALUES (?, ?, ?, ?)')
+    .run(kid, pem, JSON.stringify(jwk), Date.now());
+  toolKeyPairCache = { privateKey, publicJwk: jwk, kid };
+  return toolKeyPairCache;
 }
 app.get('/lti/jwks', async (req, res) => {
-  const jwk = await getToolJwk();
-  res.json({ keys: [jwk] });
+  const { publicJwk } = await getToolKeyPair();
+  res.json({ keys: [publicJwk] });
 });
+
+// ---- LTI Advantage service calls (NRPS today, AGS later reuses the same
+// token exchange) ----
+// A service call means: sign a short-lived JWT asserting this tool's own
+// identity (client_id) using OUR private key, trade it for an OAuth access
+// token at the platform's token endpoint, then use that token as a normal
+// Bearer credential against the actual service URL. Cached per
+// platform+scope until shortly before expiry, rather than requesting a fresh
+// token on every single service call -- the standard pattern for LTI
+// Advantage service calls (roadmap item: service-token caching).
+const serviceTokenCache = new Map(); // "platformId:scope" -> { token, expiresAt }
+async function getServiceAccessToken(platform, scope) {
+  const cacheKey = `${platform.id}:${scope}`;
+  const cached = serviceTokenCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now() + 30_000) return cached.token;
+
+  if (!platform.auth_token_url) {
+    throw new Error(`Platform ${platform.tenant_key} has no auth_token_url registered -- cannot request a service token.`);
+  }
+  const { privateKey, kid } = await getToolKeyPair();
+  const now = Math.floor(Date.now() / 1000);
+  const assertion = await new SignJWT({
+    sub: platform.client_id,
+    aud: platform.auth_token_url,
+    jti: crypto.randomBytes(16).toString('hex'),
+  })
+    .setProtectedHeader({ alg: 'RS256', kid })
+    .setIssuer(platform.client_id)
+    .setIssuedAt(now)
+    .setExpirationTime(now + 300)
+    .sign(privateKey);
+
+  const body = new URLSearchParams({
+    grant_type: 'client_credentials',
+    client_assertion_type: 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer',
+    client_assertion: assertion,
+    scope,
+  });
+  const resp = await fetch(platform.auth_token_url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body,
+  });
+  if (!resp.ok) {
+    const text = await resp.text().catch(() => '');
+    throw new Error(`Token request failed (${resp.status}): ${text.slice(0, 200)}`);
+  }
+  const data = await resp.json();
+  serviceTokenCache.set(cacheKey, { token: data.access_token, expiresAt: Date.now() + (data.expires_in || 3600) * 1000 });
+  return data.access_token;
+}
+
+// ---- Names and Role Provisioning Service ----
+// The launch-time roster (who has actually clicked into the tool) is a subset
+// of the real course membership -- NRPS is what lets the instructor dashboard
+// eventually distinguish "enrolled but never used the tutor" from "not
+// enrolled at all", instead of only ever knowing about students who happened
+// to launch.
+const NRPS_SCOPE = 'https://purl.imsglobal.org/spec/lti-nrps/scope/contextmembership.readonly';
+async function fetchCourseMembership(membershipsUrl, accessToken) {
+  const resp = await fetch(membershipsUrl, {
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      Accept: 'application/vnd.ims.lti-nrps.v2.membershipcontainer+json',
+    },
+  });
+  if (!resp.ok) {
+    const text = await resp.text().catch(() => '');
+    throw new Error(`NRPS request failed (${resp.status}): ${text.slice(0, 200)}`);
+  }
+  return resp.json(); // { id, context, members: [{ user_id, roles, status, name, email, ... }] }
+}
+
+// Fire-and-forget from /lti/launch -- never blocks the student/instructor's
+// redirect on a roster sync. Pushes the full membership into tutor-service via
+// the same /students/sync endpoint the legacy Moodle-native path uses, so both
+// roster sources land in one place rather than needing two parallel systems.
+async function syncRosterViaNrps(platform, membershipsUrl) {
+  const accessToken = await getServiceAccessToken(platform, NRPS_SCOPE);
+  const data = await fetchCourseMembership(membershipsUrl, accessToken);
+  const members = data.members || [];
+
+  const students = [];
+  for (const m of members) {
+    const roles = m.roles || [];
+    const internalRole = mapLtiRolesToInternalRole(roles);
+    const userid = await getOrAllocateUserId(platform.tenant_key, platform.issuer, m.user_id, m.email);
+    students.push({
+      userid,
+      username: m.email ? m.email.split('@')[0] : `nrps-${m.user_id}`,
+      fullname: m.name || [m.given_name, m.family_name].filter(Boolean).join(' ') || 'Unknown',
+      email: m.email || null,
+      role: internalRole,
+    });
+  }
+
+  if (!TENANT_ADMIN_SECRET) {
+    throw new Error('TENANT_ADMIN_SECRET is not configured -- cannot push the roster to tutor-service.');
+  }
+  const resp = await fetch(`${APP_BASE_URL}/students/sync`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-tenant-admin-secret': TENANT_ADMIN_SECRET },
+    body: JSON.stringify({ tenant: platform.tenant_key, students }),
+  });
+  if (!resp.ok) {
+    const text = await resp.text().catch(() => '');
+    throw new Error(`tutor-service /students/sync returned ${resp.status}: ${text.slice(0, 200)}`);
+  }
+  logAdminEvent('nrps_roster_synced', `tenant=${platform.tenant_key} members=${students.length}`, null);
+}
 
 // ---- Admin: register a platform (manual registration -- no Dynamic
 // Registration support yet). Two ways in: a browser-facing session cookie
