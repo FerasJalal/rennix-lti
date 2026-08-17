@@ -92,6 +92,13 @@ db.exec(`
     public_jwk TEXT NOT NULL,
     created_at INTEGER NOT NULL
   );
+  CREATE TABLE IF NOT EXISTS lti_dl_sessions (
+    id TEXT PRIMARY KEY,
+    platform_id INTEGER NOT NULL,
+    deep_link_return_url TEXT NOT NULL,
+    data TEXT,
+    created_at INTEGER NOT NULL
+  );
   CREATE TABLE IF NOT EXISTS admin_audit_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     event TEXT NOT NULL,
@@ -371,7 +378,7 @@ app.post('/lti/launch', rateLimit('lti-launch', 30, 60 * 1000), async (req, res)
     const messageType = payload['https://purl.imsglobal.org/spec/lti/claim/message_type'];
     const ltiVersion = payload['https://purl.imsglobal.org/spec/lti/claim/version'];
     const deploymentId = payload['https://purl.imsglobal.org/spec/lti/claim/deployment_id'];
-    if (messageType !== 'LtiResourceLinkRequest' || ltiVersion !== '1.3.0') {
+    if (ltiVersion !== '1.3.0' || !['LtiResourceLinkRequest', 'LtiDeepLinkingRequest'].includes(messageType)) {
       logAdminEvent('lti_unsupported_message', `type=${messageType} version=${ltiVersion} platform_id=${platform.id}`, req);
       return res.status(400).send(`Unsupported LTI message (type=${messageType}, version=${ltiVersion}).`);
     }
@@ -383,6 +390,16 @@ app.post('/lti/launch', rateLimit('lti-launch', 30, 60 * 1000), async (req, res)
     const roles = payload['https://purl.imsglobal.org/spec/lti/claim/roles'] || [];
     const internalRole = mapLtiRolesToInternalRole(roles);
     const isInstructor = internalRole !== 'student';
+
+    // Deep Linking: the platform is asking the instructor to pick content
+    // *inside* Rennix, not launching an already-created activity -- a
+    // completely different response shape (a signed content-selection JWT
+    // POSTed back to Moodle, not a redirect into the app). Branches off
+    // before any of the resource-link-specific handling below.
+    if (messageType === 'LtiDeepLinkingRequest') {
+      return handleDeepLinkingRequest(req, res, payload, platform, isInstructor);
+    }
+
     const context = payload['https://purl.imsglobal.org/spec/lti/claim/context'] || {};
     const resourceLink = payload['https://purl.imsglobal.org/spec/lti/claim/resource_link'] || {};
 
@@ -446,8 +463,20 @@ app.post('/lti/launch', rateLimit('lti-launch', 30, 60 * 1000), async (req, res)
 
     const nrpsClaim = payload['https://purl.imsglobal.org/spec/lti-nrps/claim/namesroleservice'];
     logAdminEvent('lti_launch_success', `tenant=${platform.tenant_key} product=${platform.product} role=${role} nrps=${nrpsClaim ? 'yes' : 'no'}`, req);
-    const dest = new URL(isInstructor ? '/app/instructor' : '/app/home', APP_BASE_URL);
+
+    // If this activity was created via Deep Linking with a specific lecture
+    // chosen, every subsequent resource-link launch of it carries that choice
+    // back in the custom claim -- route straight into that lecture (students)
+    // or its analytics (instructors) instead of the generic landing page.
+    const customClaim = payload['https://purl.imsglobal.org/spec/lti/claim/custom'] || {};
+    const deepLinkedLectureId = customClaim.rennix_lecture_id || null;
+    let destPath = isInstructor ? '/app/instructor' : '/app/home';
+    if (deepLinkedLectureId) {
+      destPath = isInstructor ? '/instructor/video-analytics' : `/lecture/${encodeURIComponent(deepLinkedLectureId)}`;
+    }
+    const dest = new URL(destPath, APP_BASE_URL);
     dest.searchParams.set('t', bridgeToken);
+    if (deepLinkedLectureId && isInstructor) dest.searchParams.set('lecture_id', deepLinkedLectureId);
     res.redirect(303, dest.toString());
 
     // Fire-and-forget: never delay the user's redirect on a roster sync. Only
@@ -466,6 +495,131 @@ app.post('/lti/launch', rateLimit('lti-launch', 30, 60 * 1000), async (req, res)
     logAdminEvent('lti_jwt_verification_failed', err.message, req);
     console.error('[LTI launch] verification failed:', err.message);
     res.status(400).send(`Launch verification failed: ${err.message}`);
+  }
+});
+
+// ---- Deep Linking: let an instructor pick real content inside Rennix while
+// adding the activity in Moodle, instead of creating one generic External Tool
+// activity and always landing on the same page. Real content only -- the
+// picker queries tutor-service's actual lecture list, nothing invented. ----
+async function fetchTenantLectures(tenantKey) {
+  const url = new URL('/content/lectures', APP_BASE_URL);
+  url.searchParams.set('tenant', tenantKey);
+  const resp = await fetch(url, { headers: { 'x-tenant-admin-secret': TENANT_ADMIN_SECRET } });
+  if (!resp.ok) throw new Error(`tutor-service /content/lectures returned ${resp.status}`);
+  const data = await resp.json();
+  return data.lectures || [];
+}
+
+function renderDeepLinkPicker(sessionId, platform, pickerItems, fetchError) {
+  const productLabel = platform.product === 'analytics' ? 'Rennix Analytics' : 'Rennix Tutor Bot';
+  const generalTitle = platform.product === 'analytics' ? 'Rennix Analytics dashboard (whole course)' : 'General Tutor Bot (course-wide, no specific lecture)';
+  const generalLink = `/lti/deep-link/select?session=${sessionId}&title=${encodeURIComponent(generalTitle)}`;
+  const items = pickerItems.map((it) => {
+    const label = `${it.chapterTitle} — ${it.title}`;
+    const href = `/lti/deep-link/select?session=${sessionId}&lecture_id=${encodeURIComponent(it.lecture_id)}&title=${encodeURIComponent(label)}`;
+    return `<a class="item" href="${href}">${escapeHtml(label)}</a>`;
+  }).join('');
+  return `<!doctype html>
+<html><head><meta charset="utf-8"><title>Add ${escapeHtml(productLabel)}</title>
+<style>
+  body { font-family:-apple-system,"Segoe UI",Roboto,Arial,sans-serif; background:#f7f8fa; margin:0; padding:32px 16px; }
+  .card { max-width:560px; margin:0 auto; background:#fff; border:1px solid #e2e8f0; border-radius:12px; padding:24px; }
+  h1 { font-size:18px; margin:0 0 4px; }
+  p.sub { color:#57606a; font-size:13px; margin:0 0 16px; }
+  .item { display:block; padding:10px 12px; border:1px solid #e2e8f0; border-radius:8px; margin-bottom:8px; text-decoration:none; color:#1a1a1a; font-size:13px; }
+  .item:hover { border-color:#d41128; }
+  .item.default { font-weight:700; margin-bottom:16px; }
+  .err { color:#a10f22; font-size:12px; margin-bottom:12px; }
+  .list { max-height:360px; overflow-y:auto; }
+</style></head>
+<body>
+  <div class="card">
+    <h1>Add ${escapeHtml(productLabel)}</h1>
+    <p class="sub">Choose what this activity should link to.</p>
+    ${fetchError ? `<div class="err">Couldn't load the lecture list (${escapeHtml(fetchError)}) -- only the general option is available.</div>` : ''}
+    <a class="item default" href="${generalLink}">${escapeHtml(generalTitle)}</a>
+    ${items ? `<div class="list">${items}</div>` : ''}
+  </div>
+</body></html>`;
+}
+
+async function handleDeepLinkingRequest(req, res, payload, platform, isInstructor) {
+  if (!isInstructor) {
+    logAdminEvent('deep_link_blocked_student', `tenant=${platform.tenant_key}`, req);
+    return res.status(403).send('Only instructors can select content to add to a course.');
+  }
+  const dlSettings = payload['https://purl.imsglobal.org/spec/lti-dl/claim/deep_linking_settings'];
+  if (!dlSettings || !dlSettings.deep_link_return_url) {
+    return res.status(400).send('Missing deep linking settings in the launch.');
+  }
+
+  const sessionId = crypto.randomBytes(16).toString('hex');
+  db.prepare('INSERT INTO lti_dl_sessions (id, platform_id, deep_link_return_url, data, created_at) VALUES (?, ?, ?, ?, ?)')
+    .run(sessionId, platform.id, dlSettings.deep_link_return_url, dlSettings.data || null, Date.now());
+
+  let pickerItems = [];
+  let fetchError = null;
+  if (platform.product === 'tutor_bot') {
+    try {
+      pickerItems = await fetchTenantLectures(platform.tenant_key);
+    } catch (err) {
+      fetchError = err.message;
+      logAdminEvent('deep_link_content_fetch_failed', `tenant=${platform.tenant_key} error=${err.message}`, req);
+    }
+  }
+
+  logAdminEvent('deep_link_picker_shown', `tenant=${platform.tenant_key} product=${platform.product} items=${pickerItems.length}`, req);
+  res.set('Content-Type', 'text/html').send(renderDeepLinkPicker(sessionId, platform, pickerItems, fetchError));
+}
+
+app.get('/lti/deep-link/select', async (req, res) => {
+  try {
+    const { session, lecture_id, title } = req.query;
+    const dlSession = db.prepare('SELECT * FROM lti_dl_sessions WHERE id = ?').get(session);
+    if (!dlSession) return res.status(400).send('Unknown or expired selection session -- restart from Moodle.');
+    db.prepare('DELETE FROM lti_dl_sessions WHERE id = ?').run(session); // single-use
+    if (Date.now() - dlSession.created_at > 10 * 60 * 1000) {
+      return res.status(400).send('This selection session expired -- restart from Moodle.');
+    }
+
+    const platform = db.prepare('SELECT * FROM platforms WHERE id = ?').get(dlSession.platform_id);
+    if (!platform) return res.status(400).send('Platform no longer registered.');
+
+    const contentItem = {
+      type: 'ltiResourceLink',
+      title: title ? String(title).slice(0, 200) : (platform.product === 'analytics' ? 'Rennix Analytics' : 'Rennix Tutor Bot'),
+      url: `${req.protocol}://${req.get('host')}/lti/launch`,
+    };
+    if (lecture_id) contentItem.custom = { rennix_lecture_id: String(lecture_id) };
+
+    const { privateKey, kid } = await getToolKeyPair();
+    const now = Math.floor(Date.now() / 1000);
+    const responseJwt = await new SignJWT({
+      'https://purl.imsglobal.org/spec/lti/claim/deployment_id': platform.deployment_id,
+      'https://purl.imsglobal.org/spec/lti/claim/message_type': 'LtiDeepLinkingResponse',
+      'https://purl.imsglobal.org/spec/lti/claim/version': '1.3.0',
+      'https://purl.imsglobal.org/spec/lti-dl/claim/content_items': [contentItem],
+      ...(dlSession.data ? { 'https://purl.imsglobal.org/spec/lti-dl/claim/data': dlSession.data } : {}),
+    })
+      .setProtectedHeader({ alg: 'RS256', kid })
+      .setIssuer(platform.client_id)
+      .setAudience(platform.issuer)
+      .setIssuedAt(now)
+      .setExpirationTime(now + 300)
+      .sign(privateKey);
+
+    logAdminEvent('deep_link_response_sent', `tenant=${platform.tenant_key} product=${platform.product} lecture_id=${lecture_id || 'none'}`, req);
+
+    res.set('Content-Type', 'text/html').send(`<!doctype html><html><body onload="document.forms[0].submit()">
+  <form method="POST" action="${escapeHtml(dlSession.deep_link_return_url)}">
+    <input type="hidden" name="JWT" value="${escapeHtml(responseJwt)}">
+  </form>
+  <p>Adding content to your course&hellip;</p>
+</body></html>`);
+  } catch (err) {
+    logAdminEvent('deep_link_response_failed', err.message, req);
+    res.status(500).send(`Deep linking failed: ${err.message}`);
   }
 });
 
