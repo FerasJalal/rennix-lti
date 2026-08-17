@@ -459,10 +459,18 @@ app.post('/lti/launch', rateLimit('lti-launch', 30, 60 * 1000), async (req, res)
       // "analytics"-only launch never sees the chat/quiz-authoring tools
       // that belong to the separate "tutor_bot" product).
       product: platform.product,
+      // Both already extracted from the verified id_token above but
+      // previously never carried past this point -- tutor-service had no
+      // verified knowledge of which Moodle course or which specific
+      // resource-link activity a launch came from, only tenant/user/role.
+      // Threaded through now so that context is actually available and
+      // auditable on the receiving side, not silently dropped.
+      courseId: identity.courseId,
+      resourceLinkId: identity.resourceLinkId,
     });
 
     const nrpsClaim = payload['https://purl.imsglobal.org/spec/lti-nrps/claim/namesroleservice'];
-    logAdminEvent('lti_launch_success', `tenant=${platform.tenant_key} product=${platform.product} role=${role} nrps=${nrpsClaim ? 'yes' : 'no'}`, req);
+    logAdminEvent('lti_launch_success', `tenant=${platform.tenant_key} product=${platform.product} role=${role} course=${identity.courseId || 'none'} resourceLink=${identity.resourceLinkId || 'none'} nrps=${nrpsClaim ? 'yes' : 'no'}`, req);
 
     // If this activity was created via Deep Linking with a specific lecture
     // chosen, every subsequent resource-link launch of it carries that choice
