@@ -4,8 +4,12 @@
   "private": true,
   "type": "commonjs",
   "main": "server.js",
+  "engines": {
+    "node": ">=18 <23"
+  },
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "test": "node --test test/*.test.js"
   },
   "dependencies": {
     "better-sqlite3": "^11.3.0",
