@@ -5,6 +5,7 @@ const { logAdminEvent } = require('../audit');
 const { escapeHtml } = require('../util/html');
 const log = require('../log');
 const { NRPS_SCOPE } = require('./nrps');
+const { AGS_SCOPES } = require('./ags');
 
 // ---- LTI 1.3 Dynamic Registration (imsglobal.org/spec/lti-dr/v1p0) ----
 // The platform (an admin adding Rennix as an External Tool from a
@@ -98,7 +99,7 @@ router.post('/lti/register/complete', async (req, res) => {
     client_name: product === 'analytics' ? 'Rennix Analytics' : 'Rennix Tutor Bot',
     jwks_uri: `${origin}/lti/jwks`,
     token_endpoint_auth_method: 'private_key_jwt',
-    scope: NRPS_SCOPE,
+    scope: `${NRPS_SCOPE} ${AGS_SCOPES}`,
     'https://purl.imsglobal.org/spec/lti-tool-configuration': {
       domain: req.get('host'),
       target_link_uri: `${origin}/lti/launch`,

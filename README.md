@@ -93,6 +93,56 @@ connect this way.
 `/lti/launched` (the old proof-of-concept identity page) is still there but no longer used by the
 real flow — harmless to keep as a debug page.
 
+## Grades (Assignment and Grade Services)
+
+Scores are pushed into the institution's own LMS gradebook via LTI's Assignment and Grade
+Services. This service only implements its half — the LMS-facing plumbing (capturing each
+activity's gradebook endpoint, creating a line item if one doesn't exist yet, submitting scores).
+**Nothing in this repo decides when a score is ready or calls this on its own** — `tutor-service`
+is expected to call it once it has a graded event to report. That's the contract:
+
+### `POST /ags/score`
+
+Header: `x-tenant-admin-secret: <TENANT_ADMIN_SECRET>` (same shared secret already used for the
+`/students/sync`-style calls in the other direction).
+
+Body (JSON):
+
+```json
+{
+  "tenant": "htu",
+  "userid": 100042,
+  "resourceLinkId": "the resource_link_id from that activity's original LTI launch",
+  "score": 8,
+  "scoreMaximum": 10,
+  "label": "optional -- gradebook column name, only used if a line item has to be created",
+  "activityProgress": "optional, defaults to \"Completed\"",
+  "gradingProgress": "optional, defaults to \"FullyGraded\""
+}
+```
+
+- `userid` is tutor-service's own internal id for the student (the same one everywhere else in
+  this integration), not the platform's own opaque `sub`.
+- `resourceLinkId` has to be the exact `resource_link_id` captured from that specific activity's
+  launch -- this is how the call gets resolved back to a platform + gradebook endpoint. There's no
+  way to push a score for an activity nobody has ever launched.
+
+Responses:
+- `200 {"ok": true}` — pushed successfully (a line item was auto-created first if this was the
+  first score ever pushed for that `resourceLinkId`).
+- `400` — missing required fields, or the named student has no recorded LTI launch on the relevant
+  platform (no `sub` to attribute the score to).
+- `401` — missing/wrong `x-tenant-admin-secret`.
+- `403` — `tenant` doesn't match the tenant that `resourceLinkId` actually belongs to.
+- `404` — unknown `resourceLinkId` (either that platform never granted AGS access for it, or it
+  was never launched at all).
+- `502` — reached this service fine, but the platform itself rejected the line-item-creation or
+  score-submission call.
+
+Manually-registered platforms need the AGS **Line Item** and **Score** service scopes enabled on
+the External Tool config by the institution's admin (Dynamic Registration requests them
+automatically).
+
 ## Architecture
 
 `server.js` is only the composition root (middleware + router mounting + listen). The actual
@@ -103,8 +153,9 @@ routes and business logic live in `src/`:
 - `src/security/` -- token signing/verification (bridge token, admin session, this tool's own
   RS256 key pair for signing outbound JWTs).
 - `src/rateLimit.js` -- in-memory per-process rate limiting (single-instance only, see below).
-- `src/lti/` -- the LTI protocol itself: login, launch/verification, Deep Linking, NRPS roster
-  sync, role mapping, and the cached-per-platform JWKS lookup.
+- `src/lti/` -- the LTI protocol itself: login, launch/verification, Deep Linking, Dynamic
+  Registration, NRPS roster sync, AGS score push, role mapping, and the cached-per-platform JWKS
+  lookup.
 - `src/admin/` -- the admin auth/session, platform registration API, and onboarding UI.
 
 Run `npm test` (Node's built-in test runner, `test/`) to exercise the JWT verification, nonce/
@@ -134,5 +185,8 @@ for Dynamic Registration (below), which will auto-discover additional deployment
 
 ## Not yet built
 
-- Assignment and Grade Services (Deep Linking, Names and Roles Provisioning, and Dynamic
-  Registration are implemented)
+Everything in the core LTI Advantage feature set (Deep Linking, Names and Roles Provisioning,
+Dynamic Registration, Assignment and Grade Services) is implemented. What isn't real-LMS-verified
+yet, since this service is developed without direct access to a live Moodle/Canvas: Dynamic
+Registration and AGS specifically (the manually-registered flow has been live-tested against
+HTU's Moodle -- see "Status" above).

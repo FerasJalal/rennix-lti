@@ -1,7 +1,7 @@
 const express = require('express');
 const { jwtVerify } = require('jose');
 const { db } = require('../db');
-const { getOrAllocateUserId, isKnownDeployment, addDeployment } = require('../db');
+const { getOrAllocateUserId, isKnownDeployment, addDeployment, upsertAgsEndpoint } = require('../db');
 const { logAdminEvent } = require('../audit');
 const { rateLimit } = require('../rateLimit');
 const { escapeHtml } = require('../util/html');
@@ -150,7 +150,24 @@ router.post('/lti/launch', rateLimit('lti-launch', 30, 60 * 1000), async (req, r
     });
 
     const nrpsClaim = payload['https://purl.imsglobal.org/spec/lti-nrps/claim/namesroleservice'];
-    logAdminEvent('lti_launch_success', `tenant=${platform.tenant_key} product=${platform.product} role=${role} course=${identity.courseId || 'none'} resourceLink=${identity.resourceLinkId || 'none'} nrps=${nrpsClaim ? 'yes' : 'no'}`, req);
+
+    // AGS: capture the platform's per-activity gradebook endpoint(s) so a
+    // later score push (tutor-service calling POST /ags/score, see
+    // src/lti/ags.js) has something to resolve resourceLinkId against. Only
+    // present when the platform actually granted the AGS scope for this
+    // activity; harmless no-op otherwise.
+    const agsClaim = payload['https://purl.imsglobal.org/spec/lti-ags/claim/endpoint'];
+    if (agsClaim && identity.resourceLinkId) {
+      upsertAgsEndpoint(identity.resourceLinkId, {
+        platformId: platform.id,
+        tenantKey: platform.tenant_key,
+        lineitemUrl: agsClaim.lineitem || null,
+        lineitemsUrl: agsClaim.lineitems || null,
+        scope: (agsClaim.scope || []).join(' '),
+      });
+    }
+
+    logAdminEvent('lti_launch_success', `tenant=${platform.tenant_key} product=${platform.product} role=${role} course=${identity.courseId || 'none'} resourceLink=${identity.resourceLinkId || 'none'} nrps=${nrpsClaim ? 'yes' : 'no'} ags=${agsClaim ? 'yes' : 'no'}`, req);
 
     // If this activity was created via Deep Linking with a specific lecture
     // chosen, every subsequent resource-link launch of it carries that choice
