@@ -69,6 +69,22 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_audit_created ON admin_audit_log(created_at);
 `);
 
+// SQLite has no `ADD COLUMN IF NOT EXISTS` -- this is the lightweight
+// migration pattern for adding a nullable/defaulted column to a table that
+// may already exist from before this column was introduced.
+function addColumnIfMissing(table, column, ddl) {
+  const columns = db.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name);
+  if (!columns.includes(column)) {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${ddl}`);
+  }
+}
+addColumnIfMissing('platforms', 'active', 'active INTEGER NOT NULL DEFAULT 1');
+// Presence of enc_iv/enc_tag on a tool_keys row is what distinguishes an
+// at-rest-encrypted private_key_pem from a legacy plaintext one -- see
+// src/security/toolKeys.js and src/security/keyEncryption.js.
+addColumnIfMissing('tool_keys', 'enc_iv', 'enc_iv TEXT');
+addColumnIfMissing('tool_keys', 'enc_tag', 'enc_tag TEXT');
+
 // States/nonces are single-use and short-lived (10 min) -- sweep expired
 // rows on every login attempt rather than running a separate cron.
 function sweepExpiredStates() {
@@ -77,10 +93,14 @@ function sweepExpiredStates() {
 
 function getPlatform({ issuer, clientId }) {
   if (clientId) {
-    return db.prepare('SELECT * FROM platforms WHERE issuer = ? AND client_id = ?').get(issuer, clientId);
+    return db.prepare('SELECT * FROM platforms WHERE issuer = ? AND client_id = ? AND active = 1').get(issuer, clientId);
   }
-  const rows = db.prepare('SELECT * FROM platforms WHERE issuer = ?').all(issuer);
+  const rows = db.prepare('SELECT * FROM platforms WHERE issuer = ? AND active = 1').all(issuer);
   return rows.length === 1 ? rows[0] : null; // ambiguous without a client_id if more than one
+}
+
+function setPlatformActive(id, active) {
+  db.prepare('UPDATE platforms SET active = ? WHERE id = ?').run(active ? 1 : 0, id);
 }
 
 // Shared logic behind both the JSON API (curl/scripted onboarding) and the
@@ -169,5 +189,5 @@ async function getOrAllocateUserId(tenantKey, issuer, subject, email) {
 }
 
 module.exports = {
-  db, sweepExpiredStates, getPlatform, registerPlatform, getOrAllocateUserId, findExistingUserIdByEmail,
+  db, sweepExpiredStates, getPlatform, registerPlatform, setPlatformActive, getOrAllocateUserId, findExistingUserIdByEmail,
 };

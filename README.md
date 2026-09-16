@@ -33,9 +33,12 @@ it reports `http` behind Caddy, breaking `redirect_uri` matching.
 ## Setup
 
 ```bash
-cp .env.example .env   # set ADMIN_SECRET and SESSION_SECRET to real random values
+cp .env.example .env   # set ADMIN_SECRET, SESSION_SECRET, and KEY_ENCRYPTION_SECRET to real random values
 docker compose up -d --build
 ```
+
+Admin pages: `/admin` (onboard/manage platforms) and `/admin/audit` (audit log), both behind
+`/admin/login`.
 
 ## Registering a platform (manual, until Dynamic Registration is built)
 
@@ -99,9 +102,11 @@ no real LMS needed for that layer.
   cache (`src/lti/nrps.js`) are in-memory per process, same as the SQLite database itself (a local
   Docker volume, not a shared store). None of this is safe to run as multiple replicas behind a
   load balancer without moving all three to a shared store together.
-- Secrets (`ADMIN_SECRET`, `SESSION_SECRET`, `LTI_BRIDGE_SECRET`, `TENANT_ADMIN_SECRET`, and this
-  tool's own RSA private key) are plain env vars / unencrypted SQLite rows -- no secrets manager or
-  encryption at rest yet.
+- The four cross-service secrets (`ADMIN_SECRET`, `SESSION_SECRET`, `LTI_BRIDGE_SECRET`,
+  `TENANT_ADMIN_SECRET`) are still plain env vars -- no secrets manager or rotation story yet. This
+  tool's own RSA private key, the one thing actually persisted to disk, is encrypted at rest when
+  `KEY_ENCRYPTION_SECRET` is set (see `src/security/keyEncryption.js`); it stays plaintext if that
+  var is left unset, with a startup warning.
 
 ## Not yet built
 

@@ -20,7 +20,7 @@ process.env.APP_BASE_URL = 'https://app.test';
 delete process.env.TENANT_ADMIN_SECRET; // keeps getOrAllocateUserId/NRPS paths from making real network calls
 
 const { SignJWT, generateKeyPair, exportJWK } = require('jose');
-const { registerPlatform, getPlatform } = require('../src/db');
+const { registerPlatform, getPlatform, setPlatformActive } = require('../src/db');
 const app = require('../server');
 
 function listen(server) {
@@ -197,6 +197,31 @@ test('a state can only be used once (replay of the same state fails)', async () 
   const second = await launch(tutorBotPlatform, idToken, state);
   assert.equal(second.statusCode, 400);
   assert.match(second.body, /Unknown or expired state/);
+});
+
+test('a deactivated platform rejects /lti/login as an unknown platform', async () => {
+  registerPlatform({
+    product: 'tutor_bot',
+    tenantKey: 'deactivated-tenant',
+    tenantName: 'Deactivated Tenant',
+    issuer: 'https://deactivated.test',
+    clientId: 'client-deactivated',
+    deploymentId: 'deploy-deactivated',
+    authLoginUrl: 'https://deactivated.test/auth',
+    jwksUrl: `http://127.0.0.1:${jwksPort}/jwks`,
+  });
+  const platform = getPlatform({ issuer: 'https://deactivated.test', clientId: 'client-deactivated' });
+  setPlatformActive(platform.id, false);
+
+  const qs = new URLSearchParams({
+    iss: 'https://deactivated.test',
+    login_hint: 'fake-login-hint',
+    target_link_uri: 'https://deactivated.test/mod/lti/view.php?id=1',
+    client_id: 'client-deactivated',
+  });
+  const res = await request({ port: appPort, method: 'GET', path: `/lti/login?${qs}` });
+  assert.equal(res.statusCode, 400);
+  assert.match(res.body, /Unknown platform/);
 });
 
 test('analytics product blocks a student-role launch with 403', async () => {

@@ -16,7 +16,7 @@ const router = express.Router();
 router.get('/admin', (req, res) => {
   const cookies = parseCookies(req.headers.cookie);
   if (!verifyAdminSession(cookies.admin_session)) return res.redirect('/admin/login');
-  const registered = db.prepare('SELECT product, tenant_key, tenant_name, issuer, created_at FROM platforms ORDER BY created_at DESC').all();
+  const registered = db.prepare('SELECT id, product, tenant_key, tenant_name, issuer, active, created_at FROM platforms ORDER BY created_at DESC').all();
 
   res.set('Content-Type', 'text/html').send(`<!doctype html>
 <html><head><meta charset="utf-8"><title>Onboard a school</title>
@@ -33,11 +33,19 @@ router.get('/admin', (req, res) => {
   .hint { color:#8a94a6; font-size:12px; margin-top:4px; }
   fieldset { border:1px solid #e2e8f0; border-radius:8px; margin-top:16px; padding:12px; }
   legend { font-size:12px; font-weight:700; color:#57606a; padding:0 4px; }
-  .signout { text-align:right; max-width:560px; margin:0 auto 8px; }
+  .signout { text-align:right; max-width:560px; margin:0 auto 8px; display:flex; justify-content:flex-end; gap:14px; align-items:center; }
+  .signout a { color:#8a94a6; font-size:12px; text-decoration:underline; }
   .signout button { background:none; border:none; color:#8a94a6; font-size:12px; cursor:pointer; text-decoration:underline; padding:0; margin:0; }
+  .status { display:inline-block; padding:2px 8px; border-radius:10px; font-size:11px; font-weight:700; }
+  .status.active { background:#e6f7ec; color:#1f9d55; }
+  .status.inactive { background:#f7e6e6; color:#a10f22; }
+  .rowaction { background:none; border:none; color:#8a94a6; font-size:11px; cursor:pointer; text-decoration:underline; padding:0; }
 </style></head>
 <body>
-  <div class="signout"><form method="post" action="/admin/logout"><button type="submit">Sign out</button></form></div>
+  <div class="signout">
+    <a href="/admin/audit">Audit log</a>
+    <form method="post" action="/admin/logout"><button type="submit">Sign out</button></form>
+  </div>
   <div class="card">
     <h1>Onboard a school</h1>
     <p class="sub">Registers this institution's LTI platform (so their Moodle/Canvas/Blackboard can launch the tool) and sets their own OpenAI key on tutor-service, in one submit.</p>
@@ -78,8 +86,16 @@ router.get('/admin', (req, res) => {
   <div class="card">
     <h1>Already registered</h1>
     <table>
-      <tr><th>Product</th><th>Tenant</th><th>Issuer</th></tr>
-      ${registered.map((p) => `<tr><td>${escapeHtml(p.product)}</td><td>${escapeHtml(p.tenant_name)} (${escapeHtml(p.tenant_key)})</td><td>${escapeHtml(p.issuer)}</td></tr>`).join('')}
+      <tr><th>Product</th><th>Tenant</th><th>Issuer</th><th>Status</th><th></th></tr>
+      ${registered.map((p) => `<tr>
+        <td>${escapeHtml(p.product)}</td>
+        <td>${escapeHtml(p.tenant_name)} (${escapeHtml(p.tenant_key)})</td>
+        <td>${escapeHtml(p.issuer)}</td>
+        <td><span class="status ${p.active ? 'active' : 'inactive'}">${p.active ? 'Active' : 'Inactive'}</span></td>
+        <td><form method="post" action="/admin/platforms/${p.id}/${p.active ? 'deactivate' : 'reactivate'}">
+          <button class="rowaction" type="submit">${p.active ? 'Deactivate' : 'Reactivate'}</button>
+        </form></td>
+      </tr>`).join('')}
     </table>
   </div>` : ''}
 </body></html>`);

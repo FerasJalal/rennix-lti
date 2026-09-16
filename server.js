@@ -56,6 +56,7 @@ app.use(require('./src/lti/launchedDebugPage').router);
 app.use(require('./src/admin/auth').router);
 app.use(require('./src/admin/platforms').router);
 app.use(require('./src/admin/onboard').router);
+app.use(require('./src/admin/auditView').router);
 
 if (require.main === module) {
   app.listen(PORT, () => log.info(`rennix-lti listening on ${PORT}`));
