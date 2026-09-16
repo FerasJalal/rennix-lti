@@ -20,11 +20,10 @@ it reports `http` behind Caddy, breaking `redirect_uri` matching.
 ## How a launch works
 
 1. Institution's admin adds an External Tool in their LMS pointing at
-   `https://<this-service>/lti/login`, using a `client_id`/`deployment_id` we issue them, and
-   configures their platform's own `auth_login_url` / `jwks_url` (standard LTI registration
-   fields their LMS provides).
-2. We record that registration via `POST /admin/platforms` (manual registration for now — no
-   Dynamic Registration support yet).
+   `https://<this-service>/lti/login`, using a `client_id`/`deployment_id` we issue them (manual
+   registration), or via `https://<this-service>/lti/register` if their LMS supports Dynamic
+   Registration -- see "Registering a platform" below either way.
+2. We record that registration in our own database.
 3. A user launches the tool from their course. Their LMS redirects the browser to `/lti/login`,
    we redirect to the LMS's own auth endpoint, the LMS POSTs back a signed `id_token` to
    `/lti/launch`, we verify it against the LMS's published JWKS, and only then trust the
@@ -40,7 +39,23 @@ docker compose up -d --build
 Admin pages: `/admin` (onboard/manage platforms) and `/admin/audit` (audit log), both behind
 `/admin/login`.
 
-## Registering a platform (manual, until Dynamic Registration is built)
+## Registering a platform
+
+### Dynamic Registration (preferred, where the LMS supports it)
+
+For Canvas, newer Moodle, and any other LTI 1.3 Dynamic-Registration-capable LMS: point the
+institution's admin at `https://<this-service>/lti/register` as the tool's registration URL in
+their LMS's own "add a Dynamic Registration tool" flow. The LMS opens that URL (usually in a
+popup) with `openid_configuration` and (if the platform issues one) `registration_token` query
+params; a short picker page asks which Rennix product and tenant this is for, then the tool
+completes the registration itself -- no manual `/admin/platforms` call needed. The resulting
+platform is active immediately (the `registration_token` is itself the admin's proof of
+authorization). Not every platform hands over a `deployment_id` at registration time (Canvas
+typically doesn't; Moodle typically does) -- when it doesn't, the first one seen inside a real,
+signature-verified launch is auto-registered rather than rejected, scoped to
+Dynamic-Registration-created platforms only (see `src/lti/launch.js`).
+
+### Manual (Moodle's `mod_lti`, or any platform without Dynamic Registration)
 
 ```bash
 curl -X POST https://<this-service>/admin/platforms \
@@ -119,5 +134,5 @@ for Dynamic Registration (below), which will auto-discover additional deployment
 
 ## Not yet built
 
-- Dynamic Registration (auto-onboarding instead of manual `/admin/platforms` calls)
-- Assignment and Grade Services (Deep Linking and Names and Roles Provisioning are implemented)
+- Assignment and Grade Services (Deep Linking, Names and Roles Provisioning, and Dynamic
+  Registration are implemented)
