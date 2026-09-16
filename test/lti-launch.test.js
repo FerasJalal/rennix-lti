@@ -20,7 +20,7 @@ process.env.APP_BASE_URL = 'https://app.test';
 delete process.env.TENANT_ADMIN_SECRET; // keeps getOrAllocateUserId/NRPS paths from making real network calls
 
 const { SignJWT, generateKeyPair, exportJWK } = require('jose');
-const { registerPlatform, getPlatform, setPlatformActive } = require('../src/db');
+const { registerPlatform, getPlatform, setPlatformActive, addDeployment } = require('../src/db');
 const app = require('../server');
 
 function listen(server) {
@@ -187,6 +187,21 @@ test('wrong deployment_id is rejected', async () => {
   const res = await launch(tutorBotPlatform, idToken, state);
   assert.equal(res.statusCode, 400);
   assert.match(res.body, /Deployment ID does not match/);
+});
+
+test('a second deployment_id added via addDeployment is accepted (multi-deployment support)', async () => {
+  addDeployment(tutorBotPlatform.id, 'second-deployment');
+  const { state, nonce } = await startLogin(tutorBotPlatform);
+  const idToken = await buildIdToken(tutorBotPlatform, { nonce, deploymentId: 'second-deployment' });
+  const res = await launch(tutorBotPlatform, idToken, state);
+  assert.equal(res.statusCode, 303);
+
+  // A third, still-unregistered id must still be rejected -- adding one
+  // deployment doesn't open the door to arbitrary ones.
+  const { state: state2, nonce: nonce2 } = await startLogin(tutorBotPlatform);
+  const idToken2 = await buildIdToken(tutorBotPlatform, { nonce: nonce2, deploymentId: 'still-unknown' });
+  const res2 = await launch(tutorBotPlatform, idToken2, state2);
+  assert.equal(res2.statusCode, 400);
 });
 
 test('a state can only be used once (replay of the same state fails)', async () => {

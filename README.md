@@ -108,6 +108,15 @@ no real LMS needed for that layer.
   `KEY_ENCRYPTION_SECRET` is set (see `src/security/keyEncryption.js`); it stays plaintext if that
   var is left unset, with a startup warning.
 
+## Multi-deployment support
+
+A single registration (`issuer` + `client_id`) can now launch from more than one
+`deployment_id` -- not all platforms tie the two 1:1 the way Moodle's `mod_lti` does (Canvas, for
+example, can mint a fresh `deployment_id` per course/account that installs the same client). The
+`deployment_id` given at registration is always accepted; `POST /admin/platforms/:id/deployments`
+adds more, and each registered platform's `/admin` row shows how many it has. This is groundwork
+for Dynamic Registration (below), which will auto-discover additional deployments the same way.
+
 ## Not yet built
 
 - Dynamic Registration (auto-onboarding instead of manual `/admin/platforms` calls)

@@ -67,6 +67,26 @@ db.exec(`
     created_at INTEGER NOT NULL
   );
   CREATE INDEX IF NOT EXISTS idx_audit_created ON admin_audit_log(created_at);
+  -- A platform's deployment_id column is its deployment at registration
+  -- time; this table is the full set of deployment ids that platform is
+  -- allowed to launch from (seeded from that column, can grow beyond it --
+  -- see isKnownDeployment/addDeployment). One row per (issuer, client_id)
+  -- registration can cover many real-world deployments (e.g. Canvas mints a
+  -- new deployment_id per course/account that installs the same client_id).
+  CREATE TABLE IF NOT EXISTS platform_deployments (
+    platform_id INTEGER NOT NULL,
+    deployment_id TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (platform_id, deployment_id)
+  );
+`);
+
+// Backfills platform_deployments for platforms that existed before this
+// table did -- idempotent, safe to run on every boot. New platforms are
+// seeded directly by registerPlatform below.
+db.exec(`
+  INSERT OR IGNORE INTO platform_deployments (platform_id, deployment_id, created_at)
+  SELECT id, deployment_id, created_at FROM platforms
 `);
 
 // SQLite has no `ADD COLUMN IF NOT EXISTS` -- this is the lightweight
@@ -114,6 +134,7 @@ function registerPlatform(fields) {
   if (!['analytics', 'tutor_bot'].includes(product)) {
     throw new Error("product must be 'analytics' or 'tutor_bot'");
   }
+  const now = Date.now();
   db.prepare(
     `INSERT INTO platforms (product, tenant_key, tenant_name, issuer, client_id, deployment_id, auth_login_url, auth_token_url, jwks_url, created_at)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -121,7 +142,24 @@ function registerPlatform(fields) {
        product = excluded.product, tenant_key = excluded.tenant_key, tenant_name = excluded.tenant_name,
        deployment_id = excluded.deployment_id, auth_login_url = excluded.auth_login_url,
        auth_token_url = excluded.auth_token_url, jwks_url = excluded.jwks_url`
-  ).run(product, tenantKey, tenantName, issuer, clientId, deploymentId, authLoginUrl, authTokenUrl || null, jwksUrl, Date.now());
+  ).run(product, tenantKey, tenantName, issuer, clientId, deploymentId, authLoginUrl, authTokenUrl || null, jwksUrl, now);
+
+  // Same row whether this was a fresh insert or an upsert of an existing
+  // registration -- fetch it back by its natural key to get the id.
+  const row = db.prepare('SELECT id FROM platforms WHERE issuer = ? AND client_id = ?').get(issuer, clientId);
+  db.prepare('INSERT OR IGNORE INTO platform_deployments (platform_id, deployment_id, created_at) VALUES (?, ?, ?)')
+    .run(row.id, deploymentId, now);
+}
+
+// The full set of deployment ids a platform (an (issuer, client_id)
+// registration) is allowed to launch from -- see platform_deployments above.
+function isKnownDeployment(platformId, deploymentId) {
+  return !!db.prepare('SELECT 1 FROM platform_deployments WHERE platform_id = ? AND deployment_id = ?').get(platformId, deploymentId);
+}
+
+function addDeployment(platformId, deploymentId) {
+  db.prepare('INSERT OR IGNORE INTO platform_deployments (platform_id, deployment_id, created_at) VALUES (?, ?, ?)')
+    .run(platformId, deploymentId, Date.now());
 }
 
 // tutor-service's schema keys students by a small integer id (it grew up as
@@ -189,5 +227,6 @@ async function getOrAllocateUserId(tenantKey, issuer, subject, email) {
 }
 
 module.exports = {
-  db, sweepExpiredStates, getPlatform, registerPlatform, setPlatformActive, getOrAllocateUserId, findExistingUserIdByEmail,
+  db, sweepExpiredStates, getPlatform, registerPlatform, setPlatformActive,
+  isKnownDeployment, addDeployment, getOrAllocateUserId, findExistingUserIdByEmail,
 };

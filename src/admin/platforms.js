@@ -1,5 +1,5 @@
 const express = require('express');
-const { db, registerPlatform, setPlatformActive } = require('../db');
+const { db, registerPlatform, setPlatformActive, addDeployment } = require('../db');
 const { logAdminEvent } = require('../audit');
 const { requireAdmin } = require('./auth');
 
@@ -33,6 +33,19 @@ router.post('/admin/platforms/:id/deactivate', requireAdmin, (req, res) => {
 router.post('/admin/platforms/:id/reactivate', requireAdmin, (req, res) => {
   setPlatformActive(req.params.id, true);
   logAdminEvent('platform_reactivated', `platform_id=${req.params.id}`, req);
+  res.redirect('/admin');
+});
+
+// Lets an admin manually add a second (or third, ...) deployment_id to an
+// already-registered platform -- e.g. a Canvas install where the same
+// client_id gets a fresh deployment_id per course/account. Independent of
+// Dynamic Registration existing yet; that flow (when built) uses the same
+// addDeployment underneath.
+router.post('/admin/platforms/:id/deployments', requireAdmin, (req, res) => {
+  const deploymentId = req.body && req.body.deploymentId;
+  if (!deploymentId) return res.status(400).send('Missing deploymentId.');
+  addDeployment(req.params.id, String(deploymentId));
+  logAdminEvent('deployment_added', `platform_id=${req.params.id} deployment_id=${deploymentId}`, req);
   res.redirect('/admin');
 });
 
