@@ -91,6 +91,25 @@ db.exec(`
     registration_token TEXT,
     created_at INTEGER NOT NULL
   );
+  -- Captured from the AGS endpoint claim on every LtiResourceLinkRequest
+  -- launch (src/lti/launch.js), not just Deep-Linked ones. resource_link_id
+  -- alone is the key -- per spec it's platform-issued and stable for one
+  -- activity instance, so it already pins down which platform produced it
+  -- (platform_id is stored alongside for the service-token exchange, not as
+  -- part of the key). lineitem_url is the direct per-activity gradebook
+  -- column URL when the platform already created one; lineitems_url is the
+  -- collection endpoint used to create one lazily on first score push (see
+  -- src/lti/ags.js) when lineitem_url is empty.
+  CREATE TABLE IF NOT EXISTS ags_lineitems (
+    resource_link_id TEXT PRIMARY KEY,
+    platform_id INTEGER NOT NULL,
+    tenant_key TEXT NOT NULL,
+    lineitem_url TEXT,
+    lineitems_url TEXT,
+    scope TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+  );
 `);
 
 // Backfills platform_deployments for platforms that existed before this
@@ -202,6 +221,32 @@ function addDeployment(platformId, deploymentId) {
     .run(platformId, deploymentId, Date.now());
 }
 
+// ---- AGS (see src/lti/ags.js for the actual score-push logic) ----
+// Called from src/lti/launch.js on every LtiResourceLinkRequest that carries
+// an AGS endpoint claim -- refreshes lineitems_url/scope every launch (a
+// platform could change them), but never clobbers an already-known
+// lineitem_url with a blank one from a launch that didn't happen to include
+// a direct lineitem reference.
+function upsertAgsEndpoint(resourceLinkId, { platformId, tenantKey, lineitemUrl, lineitemsUrl, scope }) {
+  const now = Date.now();
+  db.prepare(
+    `INSERT INTO ags_lineitems (resource_link_id, platform_id, tenant_key, lineitem_url, lineitems_url, scope, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(resource_link_id) DO UPDATE SET
+       lineitems_url = excluded.lineitems_url, scope = excluded.scope, updated_at = excluded.updated_at,
+       lineitem_url = COALESCE(excluded.lineitem_url, ags_lineitems.lineitem_url)`
+  ).run(resourceLinkId, platformId, tenantKey, lineitemUrl || null, lineitemsUrl || null, scope || null, now, now);
+}
+
+function getAgsLineItem(resourceLinkId) {
+  return db.prepare('SELECT * FROM ags_lineitems WHERE resource_link_id = ?').get(resourceLinkId);
+}
+
+function setAgsLineItemUrl(resourceLinkId, lineitemUrl) {
+  db.prepare('UPDATE ags_lineitems SET lineitem_url = ?, updated_at = ? WHERE resource_link_id = ?')
+    .run(lineitemUrl, Date.now(), resourceLinkId);
+}
+
 // tutor-service's schema keys students by a small integer id (it grew up as
 // a single Moodle-backed pilot, where that's just Moodle's own user id).
 // LTI's own user identifier (the `sub` claim) is an opaque, platform-chosen
@@ -270,4 +315,5 @@ module.exports = {
   db, sweepExpiredStates, sweepExpiredRegistrationSessions, getPlatform,
   registerPlatform, registerDynamicPlatform, setPlatformActive,
   isKnownDeployment, addDeployment, getOrAllocateUserId, findExistingUserIdByEmail,
+  upsertAgsEndpoint, getAgsLineItem, setAgsLineItemUrl,
 };
