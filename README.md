@@ -75,8 +75,35 @@ connect this way.
 `/lti/launched` (the old proof-of-concept identity page) is still there but no longer used by the
 real flow — harmless to keep as a debug page.
 
+## Architecture
+
+`server.js` is only the composition root (middleware + router mounting + listen). The actual
+routes and business logic live in `src/`:
+
+- `src/config.js`, `src/db.js`, `src/audit.js` -- shared config, SQLite schema/access, admin audit
+  logging.
+- `src/security/` -- token signing/verification (bridge token, admin session, this tool's own
+  RS256 key pair for signing outbound JWTs).
+- `src/rateLimit.js` -- in-memory per-process rate limiting (single-instance only, see below).
+- `src/lti/` -- the LTI protocol itself: login, launch/verification, Deep Linking, NRPS roster
+  sync, role mapping, and the cached-per-platform JWKS lookup.
+- `src/admin/` -- the admin auth/session, platform registration API, and onboarding UI.
+
+Run `npm test` (Node's built-in test runner, `test/`) to exercise the JWT verification, nonce/
+replay, deployment-id, and role-mapping logic end-to-end against a locally generated key pair --
+no real LMS needed for that layer.
+
+## Known limitations
+
+- **Single-instance only.** Rate-limit buckets (`src/rateLimit.js`) and the NRPS/AGS service-token
+  cache (`src/lti/nrps.js`) are in-memory per process, same as the SQLite database itself (a local
+  Docker volume, not a shared store). None of this is safe to run as multiple replicas behind a
+  load balancer without moving all three to a shared store together.
+- Secrets (`ADMIN_SECRET`, `SESSION_SECRET`, `LTI_BRIDGE_SECRET`, `TENANT_ADMIN_SECRET`, and this
+  tool's own RSA private key) are plain env vars / unencrypted SQLite rows -- no secrets manager or
+  encryption at rest yet.
+
 ## Not yet built
 
 - Dynamic Registration (auto-onboarding instead of manual `/admin/platforms` calls)
-- Deep Linking, Names and Roles Provisioning, Assignment and Grade Services (only a basic
-  resource-link launch is implemented)
+- Assignment and Grade Services (Deep Linking and Names and Roles Provisioning are implemented)
