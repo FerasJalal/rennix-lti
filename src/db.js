@@ -134,7 +134,7 @@ async function findExistingUserIdByEmail(tenantKey, email) {
     const data = await resp.json();
     return data.userid || null;
   } catch (err) {
-    console.error('[LTI] existing-user lookup failed:', err.message);
+    require('./log').error('[LTI] existing-user lookup failed:', err.message);
     return null;
   }
 }

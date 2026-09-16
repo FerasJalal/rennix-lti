@@ -5,7 +5,18 @@ const { db } = require('../db');
 const { logAdminEvent } = require('../audit');
 const { getToolKeyPair } = require('../security/toolKeys');
 const { escapeHtml } = require('../util/html');
+const log = require('../log');
 const { APP_BASE_URL, TENANT_ADMIN_SECRET } = require('../config');
+
+// Same reasoning as src/lti/launch.js's launchErrorMessage: the raw
+// exception text is useful to us (it's always in the audit log), not to
+// whatever's rendering this page inside the LMS.
+function deepLinkErrorMessage(err) {
+  if (process.env.NODE_ENV === 'production') {
+    return 'Deep linking failed. Contact your LMS administrator.';
+  }
+  return `Deep linking failed: ${err.message}`;
+}
 
 // ---- Deep Linking: let an instructor pick real content inside Rennix while
 // adding the activity in Moodle, instead of creating one generic External Tool
@@ -129,7 +140,8 @@ router.get('/lti/deep-link/select', async (req, res) => {
 </body></html>`);
   } catch (err) {
     logAdminEvent('deep_link_response_failed', err.message, req);
-    res.status(500).send(`Deep linking failed: ${err.message}`);
+    log.error('[LTI deep-link] response failed:', err.message);
+    res.status(500).send(deepLinkErrorMessage(err));
   }
 });
 

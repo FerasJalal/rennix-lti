@@ -10,7 +10,21 @@ const { mapLtiRolesToInternalRole } = require('./roles');
 const { getPlatformJwks } = require('./platformJwks');
 const { handleDeepLinkingRequest } = require('./deepLinking');
 const { syncRosterViaNrps } = require('./nrps');
+const log = require('../log');
 const { APP_BASE_URL } = require('../config');
+
+// The raw exception text (jose verification errors, fetch failures, etc.) is
+// useful to whoever operates this service but is not something to hand back
+// to whatever's sitting in the LMS's redirect -- it can include internal
+// URLs or library-specific wording. The full detail still always reaches
+// logAdminEvent (admin-only); only the HTTP response is generic in
+// production. Kept verbose outside production for local iteration speed.
+function launchErrorMessage(err) {
+  if (process.env.NODE_ENV === 'production') {
+    return 'Launch verification failed. Contact your LMS administrator.';
+  }
+  return `Launch verification failed: ${err.message}`;
+}
 
 const router = express.Router();
 
@@ -155,8 +169,8 @@ router.post('/lti/launch', rateLimit('lti-launch', 30, 60 * 1000), async (req, r
     // err.message only -- never the id_token itself, which is the platform's
     // signed credential for this user, not something to persist in a log.
     logAdminEvent('lti_jwt_verification_failed', err.message, req);
-    console.error('[LTI launch] verification failed:', err.message);
-    res.status(400).send(`Launch verification failed: ${err.message}`);
+    log.error('[LTI launch] verification failed:', err.message);
+    res.status(400).send(launchErrorMessage(err));
   }
 });
 

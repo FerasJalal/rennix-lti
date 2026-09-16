@@ -17,7 +17,7 @@ const LTI_BRIDGE_SECRET = process.env.LTI_BRIDGE_SECRET || '';
 const TENANT_ADMIN_SECRET = process.env.TENANT_ADMIN_SECRET || '';
 
 if (!ADMIN_SECRET) {
-  console.warn('WARNING: ADMIN_SECRET is not set -- /admin/platforms is effectively open. Set it before registering a real platform.');
+  require('./log').warn('ADMIN_SECRET is not set -- /admin/platforms is effectively open. Set it before registering a real platform.');
 }
 
 module.exports = {
