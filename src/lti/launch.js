@@ -1,7 +1,7 @@
 const express = require('express');
 const { jwtVerify } = require('jose');
 const { db } = require('../db');
-const { getOrAllocateUserId } = require('../db');
+const { getOrAllocateUserId, isKnownDeployment } = require('../db');
 const { logAdminEvent } = require('../audit');
 const { rateLimit } = require('../rateLimit');
 const { escapeHtml } = require('../util/html');
@@ -58,8 +58,8 @@ router.post('/lti/launch', rateLimit('lti-launch', 30, 60 * 1000), async (req, r
       logAdminEvent('lti_unsupported_message', `type=${messageType} version=${ltiVersion} platform_id=${platform.id}`, req);
       return res.status(400).send(`Unsupported LTI message (type=${messageType}, version=${ltiVersion}).`);
     }
-    if (deploymentId !== platform.deployment_id) {
-      logAdminEvent('lti_deployment_mismatch', `platform_id=${platform.id} tenant=${platform.tenant_key}`, req);
+    if (!isKnownDeployment(platform.id, deploymentId)) {
+      logAdminEvent('lti_deployment_mismatch', `platform_id=${platform.id} tenant=${platform.tenant_key} deployment_id=${deploymentId}`, req);
       return res.status(400).send('Deployment ID does not match this platform\'s registration.');
     }
 

@@ -16,7 +16,11 @@ const router = express.Router();
 router.get('/admin', (req, res) => {
   const cookies = parseCookies(req.headers.cookie);
   if (!verifyAdminSession(cookies.admin_session)) return res.redirect('/admin/login');
-  const registered = db.prepare('SELECT id, product, tenant_key, tenant_name, issuer, active, created_at FROM platforms ORDER BY created_at DESC').all();
+  const registered = db.prepare(`
+    SELECT p.id, p.product, p.tenant_key, p.tenant_name, p.issuer, p.active, p.created_at,
+           (SELECT COUNT(*) FROM platform_deployments d WHERE d.platform_id = p.id) AS deployment_count
+    FROM platforms p ORDER BY p.created_at DESC
+  `).all();
 
   res.set('Content-Type', 'text/html').send(`<!doctype html>
 <html><head><meta charset="utf-8"><title>Onboard a school</title>
@@ -40,6 +44,9 @@ router.get('/admin', (req, res) => {
   .status.active { background:#e6f7ec; color:#1f9d55; }
   .status.inactive { background:#f7e6e6; color:#a10f22; }
   .rowaction { background:none; border:none; color:#8a94a6; font-size:11px; cursor:pointer; text-decoration:underline; padding:0; }
+  .adddeploy { display:flex; gap:4px; align-items:center; }
+  .adddeploy input { width:110px; padding:3px 6px; font-size:11px; border:1px solid #ccc; border-radius:4px; }
+  .adddeploy button { padding:3px 8px; font-size:11px; border:1px solid #ccc; border-radius:4px; background:#fff; cursor:pointer; }
 </style></head>
 <body>
   <div class="signout">
@@ -86,12 +93,18 @@ router.get('/admin', (req, res) => {
   <div class="card">
     <h1>Already registered</h1>
     <table>
-      <tr><th>Product</th><th>Tenant</th><th>Issuer</th><th>Status</th><th></th></tr>
+      <tr><th>Product</th><th>Tenant</th><th>Issuer</th><th>Status</th><th>Deployments</th><th></th></tr>
       ${registered.map((p) => `<tr>
         <td>${escapeHtml(p.product)}</td>
         <td>${escapeHtml(p.tenant_name)} (${escapeHtml(p.tenant_key)})</td>
         <td>${escapeHtml(p.issuer)}</td>
         <td><span class="status ${p.active ? 'active' : 'inactive'}">${p.active ? 'Active' : 'Inactive'}</span></td>
+        <td>${p.deployment_count}
+          <form class="adddeploy" method="post" action="/admin/platforms/${p.id}/deployments">
+            <input name="deploymentId" placeholder="add deployment id" required>
+            <button type="submit">Add</button>
+          </form>
+        </td>
         <td><form method="post" action="/admin/platforms/${p.id}/${p.active ? 'deactivate' : 'reactivate'}">
           <button class="rowaction" type="submit">${p.active ? 'Deactivate' : 'Reactivate'}</button>
         </form></td>
