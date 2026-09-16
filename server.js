@@ -21,6 +21,8 @@
 const express = require('express');
 const cors = require('cors');
 const { PORT } = require('./src/config');
+const { db } = require('./src/db');
+const log = require('./src/log');
 
 const app = express();
 // Behind Caddy (TLS-terminating reverse proxy) -- without this, req.protocol
@@ -33,7 +35,18 @@ app.use(cors());
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
-app.get('/health', (req, res) => res.json({ ok: true }));
+// Proves the DB is actually reachable, not just that the process is up --
+// a stuck/corrupt SQLite file (e.g. the volume mount going read-only)
+// otherwise wouldn't surface until the first real request hit it.
+app.get('/health', (req, res) => {
+  try {
+    db.prepare('SELECT 1').get();
+    res.json({ ok: true });
+  } catch (err) {
+    log.error('[health] DB check failed:', err.message);
+    res.status(503).json({ ok: false, error: 'database unreachable' });
+  }
+});
 
 app.use(require('./src/security/toolKeys').router);
 app.use(require('./src/lti/login').router);
@@ -45,7 +58,7 @@ app.use(require('./src/admin/platforms').router);
 app.use(require('./src/admin/onboard').router);
 
 if (require.main === module) {
-  app.listen(PORT, () => console.log(`rennix-lti listening on ${PORT}`));
+  app.listen(PORT, () => log.info(`rennix-lti listening on ${PORT}`));
 }
 
 module.exports = app;
