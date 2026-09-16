@@ -1,7 +1,7 @@
 const express = require('express');
 const { jwtVerify } = require('jose');
 const { db } = require('../db');
-const { getOrAllocateUserId, isKnownDeployment } = require('../db');
+const { getOrAllocateUserId, isKnownDeployment, addDeployment } = require('../db');
 const { logAdminEvent } = require('../audit');
 const { rateLimit } = require('../rateLimit');
 const { escapeHtml } = require('../util/html');
@@ -59,8 +59,20 @@ router.post('/lti/launch', rateLimit('lti-launch', 30, 60 * 1000), async (req, r
       return res.status(400).send(`Unsupported LTI message (type=${messageType}, version=${ltiVersion}).`);
     }
     if (!isKnownDeployment(platform.id, deploymentId)) {
-      logAdminEvent('lti_deployment_mismatch', `platform_id=${platform.id} tenant=${platform.tenant_key} deployment_id=${deploymentId}`, req);
-      return res.status(400).send('Deployment ID does not match this platform\'s registration.');
+      // Dynamic Registration doesn't always learn a deployment_id upfront
+      // (Canvas typically doesn't; Moodle typically does) -- for platforms
+      // that came in that way, the first deployment_id seen inside an
+      // already-signature-verified launch is auto-registered rather than
+      // rejected. Manually-registered platforms keep the original strict
+      // behavior: matching a specific deployment_id the admin copied from
+      // their LMS is itself a meaningful confirmation step for those.
+      if (platform.dynamic_registration) {
+        addDeployment(platform.id, deploymentId);
+        logAdminEvent('deployment_auto_registered', `platform_id=${platform.id} tenant=${platform.tenant_key} deployment_id=${deploymentId}`, req);
+      } else {
+        logAdminEvent('lti_deployment_mismatch', `platform_id=${platform.id} tenant=${platform.tenant_key} deployment_id=${deploymentId}`, req);
+        return res.status(400).send('Deployment ID does not match this platform\'s registration.');
+      }
     }
 
     const roles = payload['https://purl.imsglobal.org/spec/lti/claim/roles'] || [];

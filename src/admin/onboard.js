@@ -17,7 +17,7 @@ router.get('/admin', (req, res) => {
   const cookies = parseCookies(req.headers.cookie);
   if (!verifyAdminSession(cookies.admin_session)) return res.redirect('/admin/login');
   const registered = db.prepare(`
-    SELECT p.id, p.product, p.tenant_key, p.tenant_name, p.issuer, p.active, p.created_at,
+    SELECT p.id, p.product, p.tenant_key, p.tenant_name, p.issuer, p.active, p.dynamic_registration, p.created_at,
            (SELECT COUNT(*) FROM platform_deployments d WHERE d.platform_id = p.id) AS deployment_count
     FROM platforms p ORDER BY p.created_at DESC
   `).all();
@@ -43,6 +43,8 @@ router.get('/admin', (req, res) => {
   .status { display:inline-block; padding:2px 8px; border-radius:10px; font-size:11px; font-weight:700; }
   .status.active { background:#e6f7ec; color:#1f9d55; }
   .status.inactive { background:#f7e6e6; color:#a10f22; }
+  .status.dynamic { background:#eef0ff; color:#3a3fd4; }
+  .status.manual { background:#f2f4f6; color:#57606a; }
   .rowaction { background:none; border:none; color:#8a94a6; font-size:11px; cursor:pointer; text-decoration:underline; padding:0; }
   .adddeploy { display:flex; gap:4px; align-items:center; }
   .adddeploy input { width:110px; padding:3px 6px; font-size:11px; border:1px solid #ccc; border-radius:4px; }
@@ -93,11 +95,12 @@ router.get('/admin', (req, res) => {
   <div class="card">
     <h1>Already registered</h1>
     <table>
-      <tr><th>Product</th><th>Tenant</th><th>Issuer</th><th>Status</th><th>Deployments</th><th></th></tr>
+      <tr><th>Product</th><th>Tenant</th><th>Issuer</th><th>Source</th><th>Status</th><th>Deployments</th><th></th></tr>
       ${registered.map((p) => `<tr>
         <td>${escapeHtml(p.product)}</td>
         <td>${escapeHtml(p.tenant_name)} (${escapeHtml(p.tenant_key)})</td>
         <td>${escapeHtml(p.issuer)}</td>
+        <td><span class="status ${p.dynamic_registration ? 'dynamic' : 'manual'}">${p.dynamic_registration ? 'Dynamic' : 'Manual'}</span></td>
         <td><span class="status ${p.active ? 'active' : 'inactive'}">${p.active ? 'Active' : 'Inactive'}</span></td>
         <td>${p.deployment_count}
           <form class="adddeploy" method="post" action="/admin/platforms/${p.id}/deployments">

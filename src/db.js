@@ -79,6 +79,18 @@ db.exec(`
     created_at INTEGER NOT NULL,
     PRIMARY KEY (platform_id, deployment_id)
   );
+  -- Short-lived, single-use, like lti_dl_sessions -- holds the platform's
+  -- fetched openid_configuration and registration_token between GET
+  -- /lti/register (which doesn't yet know which product/tenant this is for)
+  -- and POST /lti/register/complete (which does). registration_token is a
+  -- credential, so it's kept server-side rather than round-tripped through
+  -- hidden form fields.
+  CREATE TABLE IF NOT EXISTS lti_registration_sessions (
+    id TEXT PRIMARY KEY,
+    openid_config TEXT NOT NULL,
+    registration_token TEXT,
+    created_at INTEGER NOT NULL
+  );
 `);
 
 // Backfills platform_deployments for platforms that existed before this
@@ -99,6 +111,10 @@ function addColumnIfMissing(table, column, ddl) {
   }
 }
 addColumnIfMissing('platforms', 'active', 'active INTEGER NOT NULL DEFAULT 1');
+// Set on platforms created via Dynamic Registration (src/lti/dynamicRegistration.js) -- gates
+// auto-discovery of unrecognized deployment_ids in src/lti/launch.js. Manually-registered
+// platforms keep the strict, unchanged behavior from before Dynamic Registration existed.
+addColumnIfMissing('platforms', 'dynamic_registration', 'dynamic_registration INTEGER NOT NULL DEFAULT 0');
 // Presence of enc_iv/enc_tag on a tool_keys row is what distinguishes an
 // at-rest-encrypted private_key_pem from a legacy plaintext one -- see
 // src/security/toolKeys.js and src/security/keyEncryption.js.
@@ -109,6 +125,12 @@ addColumnIfMissing('tool_keys', 'enc_tag', 'enc_tag TEXT');
 // rows on every login attempt rather than running a separate cron.
 function sweepExpiredStates() {
   db.prepare('DELETE FROM lti_states WHERE created_at < ?').run(Date.now() - 10 * 60 * 1000);
+}
+
+// Same idea as sweepExpiredStates, for the Dynamic Registration hand-off
+// session (src/lti/dynamicRegistration.js).
+function sweepExpiredRegistrationSessions() {
+  db.prepare('DELETE FROM lti_registration_sessions WHERE created_at < ?').run(Date.now() - 10 * 60 * 1000);
 }
 
 function getPlatform({ issuer, clientId }) {
@@ -123,32 +145,50 @@ function setPlatformActive(id, active) {
   db.prepare('UPDATE platforms SET active = ? WHERE id = ?').run(active ? 1 : 0, id);
 }
 
-// Shared logic behind both the JSON API (curl/scripted onboarding) and the
-// HTML form (a human filling in one school's details) -- one place that
-// actually writes a platform row, so they can't drift.
-function registerPlatform(fields) {
+// Shared logic behind manual registration (the JSON API, the /admin/onboard
+// form) and Dynamic Registration (src/lti/dynamicRegistration.js) -- one
+// place that actually writes a platform row, so they can't drift.
+// requireDeployment=false is what Dynamic Registration needs: not every
+// platform's registration response includes a deployment_id upfront (Canvas
+// typically doesn't; Moodle typically does) -- deployment_id stays NOT NULL
+// at the column level (storing '' rather than loosening the schema), and
+// platform_deployments simply starts empty for that platform, to be filled
+// by launch.js's auto-discovery (gated on the `dynamic` flag this sets).
+function upsertPlatform(fields, { requireDeployment, dynamic }) {
   const { product, tenantKey, tenantName, issuer, clientId, deploymentId, authLoginUrl, authTokenUrl, jwksUrl } = fields;
-  const missing = ['product', 'tenantKey', 'tenantName', 'issuer', 'clientId', 'deploymentId', 'authLoginUrl', 'jwksUrl']
-    .filter((k) => !fields[k]);
+  const requiredFields = ['product', 'tenantKey', 'tenantName', 'issuer', 'clientId', 'authLoginUrl', 'jwksUrl'];
+  if (requireDeployment) requiredFields.push('deploymentId');
+  const missing = requiredFields.filter((k) => !fields[k]);
   if (missing.length) throw new Error(`Missing fields: ${missing.join(', ')}`);
   if (!['analytics', 'tutor_bot'].includes(product)) {
     throw new Error("product must be 'analytics' or 'tutor_bot'");
   }
   const now = Date.now();
   db.prepare(
-    `INSERT INTO platforms (product, tenant_key, tenant_name, issuer, client_id, deployment_id, auth_login_url, auth_token_url, jwks_url, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `INSERT INTO platforms (product, tenant_key, tenant_name, issuer, client_id, deployment_id, auth_login_url, auth_token_url, jwks_url, dynamic_registration, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(issuer, client_id) DO UPDATE SET
        product = excluded.product, tenant_key = excluded.tenant_key, tenant_name = excluded.tenant_name,
        deployment_id = excluded.deployment_id, auth_login_url = excluded.auth_login_url,
        auth_token_url = excluded.auth_token_url, jwks_url = excluded.jwks_url`
-  ).run(product, tenantKey, tenantName, issuer, clientId, deploymentId, authLoginUrl, authTokenUrl || null, jwksUrl, now);
+  ).run(product, tenantKey, tenantName, issuer, clientId, deploymentId || '', authLoginUrl, authTokenUrl || null, jwksUrl, dynamic ? 1 : 0, now);
 
   // Same row whether this was a fresh insert or an upsert of an existing
   // registration -- fetch it back by its natural key to get the id.
   const row = db.prepare('SELECT id FROM platforms WHERE issuer = ? AND client_id = ?').get(issuer, clientId);
-  db.prepare('INSERT OR IGNORE INTO platform_deployments (platform_id, deployment_id, created_at) VALUES (?, ?, ?)')
-    .run(row.id, deploymentId, now);
+  if (deploymentId) {
+    db.prepare('INSERT OR IGNORE INTO platform_deployments (platform_id, deployment_id, created_at) VALUES (?, ?, ?)')
+      .run(row.id, deploymentId, now);
+  }
+  return row.id;
+}
+
+function registerPlatform(fields) {
+  return upsertPlatform(fields, { requireDeployment: true, dynamic: false });
+}
+
+function registerDynamicPlatform(fields) {
+  return upsertPlatform(fields, { requireDeployment: false, dynamic: true });
 }
 
 // The full set of deployment ids a platform (an (issuer, client_id)
@@ -227,6 +267,7 @@ async function getOrAllocateUserId(tenantKey, issuer, subject, email) {
 }
 
 module.exports = {
-  db, sweepExpiredStates, getPlatform, registerPlatform, setPlatformActive,
+  db, sweepExpiredStates, sweepExpiredRegistrationSessions, getPlatform,
+  registerPlatform, registerDynamicPlatform, setPlatformActive,
   isKnownDeployment, addDeployment, getOrAllocateUserId, findExistingUserIdByEmail,
 };

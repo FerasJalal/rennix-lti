@@ -52,6 +52,7 @@ app.use(require('./src/security/toolKeys').router);
 app.use(require('./src/lti/login').router);
 app.use(require('./src/lti/launch').router);
 app.use(require('./src/lti/deepLinking').router);
+app.use(require('./src/lti/dynamicRegistration').router);
 app.use(require('./src/lti/launchedDebugPage').router);
 app.use(require('./src/admin/auth').router);
 app.use(require('./src/admin/platforms').router);
