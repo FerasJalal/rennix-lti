@@ -32,9 +32,21 @@ async function createLineItem(platform, lineitemsUrl, { scoreMaximum, label, res
   return created.id;
 }
 
+// A lineitem URL can carry its own query string (e.g. Moodle's
+// `.../lineitem?type_id=1`) -- naive string concatenation of `/scores` would
+// land after the query string instead of extending the path, producing an
+// invalid URL the platform can't route (caught via real-Moodle testing;
+// the mocked test platform's URLs happened to have no query string, which
+// is exactly why this needs a real URL object, not a template literal).
+function scoresUrlFor(lineitemUrl) {
+  const url = new URL(lineitemUrl);
+  url.pathname += '/scores';
+  return url.toString();
+}
+
 async function pushScore(platform, lineitemUrl, { subject, scoreGiven, scoreMaximum, activityProgress, gradingProgress }) {
   const accessToken = await getServiceAccessToken(platform, AGS_SCORE_SCOPE);
-  const resp = await fetch(`${lineitemUrl}/scores`, {
+  const resp = await fetch(scoresUrlFor(lineitemUrl), {
     method: 'POST',
     headers: { 'Content-Type': 'application/vnd.ims.lis.v1.score+json', Authorization: `Bearer ${accessToken}` },
     body: JSON.stringify({
