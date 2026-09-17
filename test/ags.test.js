@@ -79,8 +79,13 @@ before(async () => {
       } else if (req.url === '/lineitems') {
         capturedLineitemsRequests.push({ headers: req.headers, body: JSON.parse(bodyText) });
         res.setHeader('Content-Type', 'application/json');
-        res.end(JSON.stringify({ id: `http://127.0.0.1:${platformPort}${createdLineItemPath}` }));
-      } else if (req.url.endsWith('/scores')) {
+        // Real Moodle returns a lineitem id/URL carrying its own query
+        // string (e.g. `?type_id=1`) -- regression coverage for a bug found
+        // via real-Moodle testing where `/scores` was naively concatenated
+        // onto the end, landing after the query string instead of extending
+        // the path.
+        res.end(JSON.stringify({ id: `http://127.0.0.1:${platformPort}${createdLineItemPath}?type_id=1` }));
+      } else if (req.url.startsWith(`${createdLineItemPath}/scores`) || req.url.endsWith('/scores')) {
         capturedScoresRequests.push({ path: req.url, headers: req.headers, body: JSON.parse(bodyText) });
         res.statusCode = 200;
         res.end('{}');
@@ -211,10 +216,12 @@ test('POST /ags/score with only a lineitems collection URL auto-creates a line i
   assert.equal(first.statusCode, 200);
   assert.equal(capturedLineitemsRequests.length, 1, 'expected exactly one line item creation call');
   assert.equal(capturedScoresRequests.length, 1);
-  assert.equal(capturedScoresRequests[0].path, `${createdLineItemPath}/scores`);
+  // Regression: /scores must extend the path, not land after the lineitem
+  // URL's own query string.
+  assert.equal(capturedScoresRequests[0].path, `${createdLineItemPath}/scores?type_id=1`);
 
   const row = db.prepare('SELECT lineitem_url FROM ags_lineitems WHERE resource_link_id = ?').get('rl-lazy');
-  assert.equal(row.lineitem_url, `http://127.0.0.1:${platformPort}${createdLineItemPath}`);
+  assert.equal(row.lineitem_url, `http://127.0.0.1:${platformPort}${createdLineItemPath}?type_id=1`);
 
   const second = await pushScore({ tenant: 'ags-tenant-4', userid, resourceLinkId: 'rl-lazy', score: 7, scoreMaximum: 10, secret: process.env.TENANT_ADMIN_SECRET });
   assert.equal(second.statusCode, 200);
