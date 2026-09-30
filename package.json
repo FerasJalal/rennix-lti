@@ -5,16 +5,20 @@
   "type": "commonjs",
   "main": "server.js",
   "engines": {
-    "node": ">=18 <23"
+    "node": ">=20 <27"
   },
   "scripts": {
     "start": "node server.js",
-    "test": "node --test test/*.test.js"
+    "test": "node --test --require ./test/setup.js test/*.test.js",
+    "migrate:sqlite-to-postgres": "node scripts/migrate-sqlite-to-postgres.js"
   },
   "dependencies": {
-    "better-sqlite3": "^11.3.0",
     "cors": "^2.8.5",
     "express": "^4.19.2",
-    "jose": "^5.9.6"
+    "jose": "^5.9.6",
+    "pg": "^8.23.0"
+  },
+  "optionalDependencies": {
+    "better-sqlite3": "^12.11.1"
   }
 }

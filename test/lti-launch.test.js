@@ -5,14 +5,12 @@
 // JWKS endpoint must only be hit once across many launches of the same
 // platform, not once per launch.
 
-const os = require('os');
 const path = require('path');
 const http = require('http');
 const crypto = require('crypto');
-const { test, before, after } = require('node:test');
+const { test, before, after, beforeEach } = require('node:test');
 const assert = require('node:assert/strict');
 
-process.env.DB_PATH = path.join(os.tmpdir(), `lti-test-${crypto.randomBytes(6).toString('hex')}.db`);
 process.env.ADMIN_SECRET = 'test-admin-secret';
 process.env.SESSION_SECRET = 'test-session-secret';
 process.env.LTI_BRIDGE_SECRET = 'test-bridge-secret';
@@ -20,7 +18,7 @@ process.env.APP_BASE_URL = 'https://app.test';
 delete process.env.TENANT_ADMIN_SECRET; // keeps getOrAllocateUserId/NRPS paths from making real network calls
 
 const { SignJWT, generateKeyPair, exportJWK } = require('jose');
-const { registerPlatform, getPlatform, setPlatformActive, addDeployment } = require('../src/db');
+const { db, registerPlatform, getPlatform, setPlatformActive, addDeployment } = require('../src/db');
 const app = require('../server');
 
 function listen(server) {
@@ -74,7 +72,7 @@ before(async () => {
   });
   jwksPort = await listen(jwksServer);
 
-  registerPlatform({
+  await registerPlatform({
     product: 'tutor_bot',
     tenantKey: 'test-tenant',
     tenantName: 'Test Tenant',
@@ -84,9 +82,9 @@ before(async () => {
     authLoginUrl: 'https://issuer.test/auth',
     jwksUrl: `http://127.0.0.1:${jwksPort}/jwks`,
   });
-  tutorBotPlatform = getPlatform({ issuer: 'https://issuer.test', clientId: 'client-tutor-bot' });
+  tutorBotPlatform = await getPlatform({ issuer: 'https://issuer.test', clientId: 'client-tutor-bot' });
 
-  registerPlatform({
+  await registerPlatform({
     product: 'analytics',
     tenantKey: 'test-tenant',
     tenantName: 'Test Tenant',
@@ -96,8 +94,12 @@ before(async () => {
     authLoginUrl: 'https://issuer.test/auth',
     jwksUrl: `http://127.0.0.1:${jwksPort}/jwks`,
   });
-  analyticsPlatform = getPlatform({ issuer: 'https://issuer.test', clientId: 'client-analytics' });
+  analyticsPlatform = await getPlatform({ issuer: 'https://issuer.test', clientId: 'client-analytics' });
 });
+
+// Every test logs in from the same address; don't let the login rate limit
+// (30/min) decide the outcome of tests further down the file.
+beforeEach(() => db.run('DELETE FROM rate_limits'));
 
 after(async () => {
   await new Promise((resolve) => appServer.close(resolve));
@@ -106,8 +108,9 @@ after(async () => {
 
 // Drives GET /lti/login for the given platform and returns the {state, nonce}
 // pair the server minted, read straight off the redirect Location header.
-async function startLogin(platform) {
+async function startLogin(platform, extra = {}) {
   const qs = new URLSearchParams({
+    ...extra,
     iss: platform.issuer,
     login_hint: 'fake-login-hint',
     target_link_uri: 'https://issuer.test/mod/lti/view.php?id=1',
@@ -116,10 +119,15 @@ async function startLogin(platform) {
   const res = await request({ port: appPort, method: 'GET', path: `/lti/login?${qs}` });
   assert.equal(res.statusCode, 302);
   const location = new URL(res.headers.location);
-  return { state: location.searchParams.get('state'), nonce: location.searchParams.get('nonce') };
+  const state = location.searchParams.get('state');
+  // What a browser would send back to /lti/launch: the cookie login just set.
+  const cookie = res.headers['set-cookie'][0].split(';')[0];
+  cookies.set(state, cookie);
+  return { state, nonce: location.searchParams.get('nonce'), cookie };
 }
+const cookies = new Map(); // state -> the login's cookie
 
-function buildIdToken(platform, { nonce, deploymentId, roles, messageType, version }) {
+function buildIdToken(platform, { nonce, deploymentId, roles, messageType, version, custom, presentation }) {
   const now = Math.floor(Date.now() / 1000);
   return new SignJWT({
     nonce,
@@ -130,8 +138,10 @@ function buildIdToken(platform, { nonce, deploymentId, roles, messageType, versi
     'https://purl.imsglobal.org/spec/lti/claim/version': version ?? '1.3.0',
     'https://purl.imsglobal.org/spec/lti/claim/deployment_id': deploymentId ?? platform.deployment_id,
     'https://purl.imsglobal.org/spec/lti/claim/roles': roles ?? ['http://purl.imsglobal.org/vocab/lis/v2/membership#Learner'],
-    'https://purl.imsglobal.org/spec/lti/claim/context': { id: 'course-1', title: 'Test Course' },
+    'https://purl.imsglobal.org/spec/lti/claim/context': { id: 'course-1', title: 'Test Course', label: 'TC101' },
     'https://purl.imsglobal.org/spec/lti/claim/resource_link': { id: 'rl-1' },
+    ...(custom ? { 'https://purl.imsglobal.org/spec/lti/claim/custom': custom } : {}),
+    ...(presentation ? { 'https://purl.imsglobal.org/spec/lti/claim/launch_presentation': presentation } : {}),
   })
     .setProtectedHeader({ alg: 'RS256', kid: KID })
     .setIssuer(platform.issuer)
@@ -141,12 +151,12 @@ function buildIdToken(platform, { nonce, deploymentId, roles, messageType, versi
     .sign(privateKey);
 }
 
-async function launch(platform, idToken, state) {
+async function launch(platform, idToken, state, { cookie = cookies.get(state) } = {}) {
   return request({
     port: appPort,
     method: 'POST',
     path: '/lti/launch',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', ...(cookie ? { Cookie: cookie } : {}) },
     body: JSON.stringify({ id_token: idToken, state }),
   });
 }
@@ -173,6 +183,72 @@ test('valid instructor launch redirects to the instructor app', async () => {
   assert.equal(dest.origin + dest.pathname, 'https://app.test/app/instructor');
 });
 
+test('the bridge token carries display-only course title/code and school name', async () => {
+  const { state, nonce } = await startLogin(tutorBotPlatform);
+  const res = await launch(tutorBotPlatform, await buildIdToken(tutorBotPlatform, { nonce }), state);
+  const token = new URL(res.headers.location).searchParams.get('t');
+  const claims = JSON.parse(Buffer.from(token.split('.')[0], 'base64url').toString());
+  assert.equal(claims.courseTitle, 'Test Course');
+  assert.equal(claims.courseLabel, 'TC101');
+  assert.equal(claims.tenantName, 'Test Tenant');
+});
+
+test('a rennix_view=chat launch (video side panel) lands on the chat panel, for students and instructors', async () => {
+  for (const roles of [undefined, ['http://purl.imsglobal.org/vocab/lis/v2/membership#Instructor']]) {
+    const { state, nonce } = await startLogin(tutorBotPlatform);
+    const idToken = await buildIdToken(tutorBotPlatform, { nonce, roles, custom: { rennix_view: 'chat' } });
+    const res = await launch(tutorBotPlatform, idToken, state);
+    assert.equal(res.statusCode, 303);
+    const dest = new URL(res.headers.location);
+    assert.equal(dest.origin + dest.pathname, 'https://app.test/widget/course/chat');
+    assert.ok(dest.searchParams.get('t'));
+  }
+});
+
+test('Deep-Linked knowledge checks and PDFs route to their pages and carry the activity kind', async () => {
+  const bridgeClaims = (res) => JSON.parse(Buffer.from(new URL(res.headers.location).searchParams.get('t').split('.')[0], 'base64url').toString());
+  let { state, nonce } = await startLogin(tutorBotPlatform);
+  let res = await launch(tutorBotPlatform, await buildIdToken(tutorBotPlatform, {
+    nonce, custom: { rennix_view: 'knowledge_check', rennix_lecture_id: 'loops' },
+  }), state);
+  let dest = new URL(res.headers.location);
+  assert.equal(dest.pathname, '/widget/knowledge-check');
+  assert.equal(dest.searchParams.get('lecture'), 'loops');
+  assert.deepEqual(bridgeClaims(res).activity, { view: 'knowledge_check', lectureId: 'loops', pdfId: null });
+
+  ({ state, nonce } = await startLogin(tutorBotPlatform));
+  res = await launch(tutorBotPlatform, await buildIdToken(tutorBotPlatform, {
+    nonce, roles: ['http://purl.imsglobal.org/vocab/lis/v2/membership#Instructor'], custom: { rennix_view: 'knowledge_check', rennix_lecture_id: 'loops' },
+  }), state);
+  assert.equal(new URL(res.headers.location).pathname, '/quiz/review', 'instructors review the lecture\'s questions');
+
+  ({ state, nonce } = await startLogin(tutorBotPlatform));
+  res = await launch(tutorBotPlatform, await buildIdToken(tutorBotPlatform, { nonce, custom: { rennix_pdf_id: '7' } }), state);
+  dest = new URL(res.headers.location);
+  assert.equal(dest.pathname, '/pdf/7');
+  assert.equal(dest.searchParams.get('chat'), '1');
+  assert.deepEqual(bridgeClaims(res).activity, { view: 'pdf', lectureId: null, pdfId: 7 });
+
+  ({ state, nonce } = await startLogin(tutorBotPlatform));
+  res = await launch(tutorBotPlatform, await buildIdToken(tutorBotPlatform, { nonce }), state);
+  assert.deepEqual(bridgeClaims(res).activity, { view: null, lectureId: null, pdfId: null }, 'a plain launch is the course-wide activity');
+
+  ({ state, nonce } = await startLogin(analyticsPlatform));
+  res = await launch(analyticsPlatform, await buildIdToken(analyticsPlatform, {
+    nonce, roles: ['http://purl.imsglobal.org/vocab/lis/v2/membership#Instructor'],
+  }), state);
+  assert.deepEqual(bridgeClaims(res).activity, { view: 'analytics', lectureId: null, pdfId: null }, 'Analytics is never a grade target');
+});
+
+test('rennix_view=chat is ignored for the Analytics product', async () => {
+  const { state, nonce } = await startLogin(analyticsPlatform);
+  const idToken = await buildIdToken(analyticsPlatform, {
+    nonce, roles: ['http://purl.imsglobal.org/vocab/lis/v2/membership#Instructor'], custom: { rennix_view: 'chat' },
+  });
+  const res = await launch(analyticsPlatform, idToken, state);
+  assert.equal(new URL(res.headers.location).pathname, '/app/instructor');
+});
+
 test('nonce mismatch is rejected', async () => {
   const { state } = await startLogin(tutorBotPlatform);
   const idToken = await buildIdToken(tutorBotPlatform, { nonce: 'wrong-nonce' });
@@ -186,11 +262,11 @@ test('wrong deployment_id is rejected', async () => {
   const idToken = await buildIdToken(tutorBotPlatform, { nonce, deploymentId: 'not-the-real-deployment' });
   const res = await launch(tutorBotPlatform, idToken, state);
   assert.equal(res.statusCode, 400);
-  assert.match(res.body, /Deployment ID does not match/);
+  assert.match(res.body, /deployment ID mismatch/);
 });
 
 test('a second deployment_id added via addDeployment is accepted (multi-deployment support)', async () => {
-  addDeployment(tutorBotPlatform.id, 'second-deployment');
+  await addDeployment(tutorBotPlatform.id, 'second-deployment');
   const { state, nonce } = await startLogin(tutorBotPlatform);
   const idToken = await buildIdToken(tutorBotPlatform, { nonce, deploymentId: 'second-deployment' });
   const res = await launch(tutorBotPlatform, idToken, state);
@@ -215,7 +291,7 @@ test('a state can only be used once (replay of the same state fails)', async () 
 });
 
 test('a deactivated platform rejects /lti/login as an unknown platform', async () => {
-  registerPlatform({
+  await registerPlatform({
     product: 'tutor_bot',
     tenantKey: 'deactivated-tenant',
     tenantName: 'Deactivated Tenant',
@@ -225,8 +301,8 @@ test('a deactivated platform rejects /lti/login as an unknown platform', async (
     authLoginUrl: 'https://deactivated.test/auth',
     jwksUrl: `http://127.0.0.1:${jwksPort}/jwks`,
   });
-  const platform = getPlatform({ issuer: 'https://deactivated.test', clientId: 'client-deactivated' });
-  setPlatformActive(platform.id, false);
+  const platform = await getPlatform({ issuer: 'https://deactivated.test', clientId: 'client-deactivated' });
+  await setPlatformActive(platform.id, false);
 
   const qs = new URLSearchParams({
     iss: 'https://deactivated.test',
@@ -237,6 +313,24 @@ test('a deactivated platform rejects /lti/login as an unknown platform', async (
   const res = await request({ port: appPort, method: 'GET', path: `/lti/login?${qs}` });
   assert.equal(res.statusCode, 400);
   assert.match(res.body, /Unknown platform/);
+});
+
+test('an observer (Mentor) launch gets an explanation page, not student access', async () => {
+  const { state, nonce } = await startLogin(tutorBotPlatform);
+  const idToken = await buildIdToken(tutorBotPlatform, { nonce, roles: ['http://purl.imsglobal.org/vocab/lis/v2/membership#Mentor'] });
+  const res = await launch(tutorBotPlatform, idToken, state);
+  assert.equal(res.statusCode, 403);
+  assert.match(res.body, /Not available for observers yet/);
+  assert.equal(res.headers.location, undefined, 'no redirect into the app');
+});
+
+test('a TA sent as an Instructor sub-role lands on the instructor app', async () => {
+  const { state, nonce } = await startLogin(tutorBotPlatform);
+  const idToken = await buildIdToken(tutorBotPlatform, {
+    nonce, roles: ['http://purl.imsglobal.org/vocab/lis/v2/membership/Instructor#TeachingAssistant'],
+  });
+  const res = await launch(tutorBotPlatform, idToken, state);
+  assert.equal(new URL(res.headers.location).pathname, '/app/instructor');
 });
 
 test('analytics product blocks a student-role launch with 403', async () => {
@@ -264,4 +358,91 @@ test('the platform JWKS endpoint is only fetched once per platform, not once per
   // Before the fix, every successful verification would have caused its own
   // fetch regardless of platform, i.e. 5.
   assert.equal(jwksHitCount, 2, `expected exactly 2 JWKS fetches (one per platform), got ${jwksHitCount}`);
+});
+
+// ---- The launch must finish in the browser that started it ----
+const tokenClaims = (res) => JSON.parse(Buffer.from(new URL(res.headers.location).searchParams.get('t').split('.')[0], 'base64url').toString());
+const moodlePlatform = () => ({ ...tutorBotPlatform, auth_login_url: 'https://moodle.test/mod/lti/auth.php' });
+
+test('login sets a per-launch cookie that works inside the LMS iframe and only goes to /lti/launch', async () => {
+  const { state, cookie } = await startLogin(tutorBotPlatform);
+  assert.equal(cookie, `lti_state_${state}=1`);
+  const res = await request({ port: appPort, method: 'GET', path: `/lti/login?${new URLSearchParams({ iss: 'https://issuer.test', login_hint: 'x', target_link_uri: 'https://issuer.test/x', client_id: 'client-tutor-bot' })}` });
+  const setCookie = res.headers['set-cookie'][0];
+  for (const attr of ['HttpOnly', 'Secure', 'SameSite=None', 'Partitioned', 'Path=/lti/launch']) {
+    assert.ok(setCookie.includes(attr), `${attr} in ${setCookie}`);
+  }
+});
+
+test('a launch from a browser without the cookie is refused with an "open in a new tab" page, and the state is spent', async () => {
+  const { state, nonce, cookie } = await startLogin(tutorBotPlatform);
+  const idToken = await buildIdToken(tutorBotPlatform, { nonce, presentation: { return_url: 'https://issuer.test/course/view.php?id=3', document_target: 'iframe' } });
+  const res = await launch(tutorBotPlatform, idToken, state, { cookie: null });
+  assert.equal(res.statusCode, 403);
+  assert.equal(res.headers.location, undefined, 'no bridge token, no redirect into the app');
+  assert.match(res.body, /Open Rennix in a new tab/);
+  assert.match(res.body, /href="https:\/\/issuer\.test\/course\/view\.php\?id=3"/, 'no Moodle hint: falls back to the course');
+
+  const retry = await launch(tutorBotPlatform, idToken, state, { cookie });
+  assert.equal(retry.statusCode, 400, 'the state cannot be retried once refused');
+});
+
+test("another launch's cookie doesn't count", async () => {
+  const first = await startLogin(tutorBotPlatform);
+  const second = await startLogin(tutorBotPlatform);
+  const res = await launch(tutorBotPlatform, await buildIdToken(tutorBotPlatform, { nonce: second.nonce }), second.state, { cookie: first.cookie });
+  assert.equal(res.statusCode, 403);
+});
+
+test("from Moodle, the new-tab link reopens the same activity through Moodle's own launch", async () => {
+  const { relaunchUrl } = require('../src/lti/browserBinding');
+  assert.equal(relaunchUrl(moodlePlatform(), JSON.stringify({ cmid: 42, launchid: 'ltilaunch1_123' })), 'https://moodle.test/mod/lti/launch.php?id=42');
+  assert.equal(relaunchUrl(moodlePlatform(), JSON.stringify({ cmid: '42; evil' })), null, 'only a numeric activity id');
+  assert.equal(relaunchUrl(moodlePlatform(), 'not json'), null);
+  assert.equal(relaunchUrl(tutorBotPlatform, JSON.stringify({ cmid: 42 })), null, 'not a Moodle auth URL');
+
+  // The hint given at login is what the refused launch uses.
+  const { state, nonce } = await startLogin(tutorBotPlatform, { lti_message_hint: JSON.stringify({ cmid: 7, launchid: 'x' }) });
+  const row = await db.one('SELECT lti_message_hint FROM lti_states WHERE state = ?', [state]);
+  assert.equal(JSON.parse(row.lti_message_hint).cmid, 7);
+  await launch(tutorBotPlatform, await buildIdToken(tutorBotPlatform, { nonce }), state); // tidy up
+});
+
+// ---- launch_presentation ----
+test('the bridge token carries where "Back to course" goes and how the LMS opened us', async () => {
+  const { state, nonce } = await startLogin(tutorBotPlatform);
+  const res = await launch(tutorBotPlatform, await buildIdToken(tutorBotPlatform, {
+    nonce, presentation: { return_url: 'https://issuer.test/mod/lti/return.php?course=3', document_target: 'window' },
+  }), state);
+  assert.equal(res.statusCode, 303);
+  const claims = tokenClaims(res);
+  assert.equal(claims.returnUrl, 'https://issuer.test/mod/lti/return.php?course=3');
+  assert.equal(claims.documentTarget, 'window');
+});
+
+test('a non-http return_url is dropped, never turned into a link', async () => {
+  const { state, nonce } = await startLogin(tutorBotPlatform);
+  const res = await launch(tutorBotPlatform, await buildIdToken(tutorBotPlatform, {
+    nonce, roles: ['http://purl.imsglobal.org/vocab/lis/v2/membership#Mentor'],
+    presentation: { return_url: 'javascript:alert(1)', document_target: 'popup' },
+  }), state);
+  assert.equal(res.statusCode, 403);
+  assert.doesNotMatch(res.body, /javascript:|Back to course/);
+});
+
+test('explanation and error pages offer "Back to course"; errors pass the reason back to the LMS', async () => {
+  const back = 'https://issuer.test/mod/lti/return.php?course=3';
+  let { state, nonce } = await startLogin(tutorBotPlatform);
+  let res = await launch(tutorBotPlatform, await buildIdToken(tutorBotPlatform, {
+    nonce, roles: ['http://purl.imsglobal.org/vocab/lis/v2/membership#Mentor'], presentation: { return_url: back },
+  }), state);
+  assert.match(res.body, /Back to course/);
+  assert.match(res.body, /href="https:\/\/issuer\.test\/mod\/lti\/return\.php\?course=3" target="_top"/);
+
+  ({ state, nonce } = await startLogin(tutorBotPlatform));
+  res = await launch(tutorBotPlatform, await buildIdToken(tutorBotPlatform, {
+    nonce, deploymentId: 'unknown-deployment', presentation: { return_url: back },
+  }), state);
+  assert.equal(res.statusCode, 400);
+  assert.match(res.body, /return\.php\?course=3&amp;lti_errormsg=This\+Rennix\+connection/);
 });

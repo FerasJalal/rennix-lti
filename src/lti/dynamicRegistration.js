@@ -1,6 +1,7 @@
 const crypto = require('crypto');
 const express = require('express');
 const { db, sweepExpiredRegistrationSessions, registerDynamicPlatform } = require('../db');
+const { asyncRoute } = require('../util/asyncRoute');
 const { logAdminEvent } = require('../audit');
 const { escapeHtml } = require('../util/html');
 const log = require('../log');
@@ -17,8 +18,8 @@ const { AGS_SCOPES } = require('./ags');
 // platform.
 const router = express.Router();
 
-router.get('/lti/register', async (req, res) => {
-  sweepExpiredRegistrationSessions();
+router.get('/lti/register', asyncRoute(async (req, res) => {
+  await sweepExpiredRegistrationSessions();
   const { openid_configuration: openidConfigUrl, registration_token: registrationToken } = req.query;
   if (!openidConfigUrl) {
     return res.status(400).send('Missing openid_configuration.');
@@ -41,12 +42,12 @@ router.get('/lti/register', async (req, res) => {
   }
 
   const sessionId = crypto.randomBytes(16).toString('hex');
-  db.prepare('INSERT INTO lti_registration_sessions (id, openid_config, registration_token, created_at) VALUES (?, ?, ?, ?)')
-    .run(sessionId, JSON.stringify(openidConfig), registrationToken || null, Date.now());
+  await db.run('INSERT INTO lti_registration_sessions (id, openid_config, registration_token, created_at) VALUES (?, ?, ?, ?)',
+    [sessionId, JSON.stringify(openidConfig), registrationToken || null, Date.now()]);
 
   logAdminEvent('dynamic_registration_started', `issuer=${openidConfig.issuer}`, req);
   res.set('Content-Type', 'text/html').send(renderPickerPage(sessionId, openidConfig));
-});
+}));
 
 function renderPickerPage(sessionId, openidConfig) {
   return `<!doctype html>
@@ -81,11 +82,11 @@ function renderPickerPage(sessionId, openidConfig) {
 </body></html>`;
 }
 
-router.post('/lti/register/complete', async (req, res) => {
+router.post('/lti/register/complete', asyncRoute(async (req, res) => {
   const { session, product, tenantKey, tenantName } = req.body;
-  const sessionRow = db.prepare('SELECT * FROM lti_registration_sessions WHERE id = ?').get(session);
+  // Single-use, atomically (see launch.js).
+  const sessionRow = (await db.run('DELETE FROM lti_registration_sessions WHERE id = ? RETURNING *', [String(session || '')])).rows[0];
   if (!sessionRow) return res.status(400).send('Unknown or expired registration session -- restart from your LMS.');
-  db.prepare('DELETE FROM lti_registration_sessions WHERE id = ?').run(session); // single-use
 
   const openidConfig = JSON.parse(sessionRow.openid_config);
   const origin = `${req.protocol}://${req.get('host')}`;
@@ -137,7 +138,7 @@ router.post('/lti/register/complete', async (req, res) => {
   }
 
   try {
-    registerDynamicPlatform({
+    await registerDynamicPlatform({
       product,
       tenantKey,
       tenantName,
@@ -154,7 +155,7 @@ router.post('/lti/register/complete', async (req, res) => {
 
   logAdminEvent('dynamic_registration_completed', `${product} / ${tenantKey} issuer=${openidConfig.issuer} client_id=${clientId}`, req);
   res.set('Content-Type', 'text/html').send(renderCompletePage());
-});
+}));
 
 function renderCompletePage() {
   return `<!doctype html>

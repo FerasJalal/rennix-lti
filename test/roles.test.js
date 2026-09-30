@@ -43,3 +43,39 @@ test('supervisor role wins when multiple roles present', () => {
   ];
   assert.equal(mapLtiRolesToInternalRole(roles), 'course_supervisor');
 });
+
+const M = 'http://purl.imsglobal.org/vocab/lis/v2/membership';
+const { isInstructorRole } = require('../src/lti/roles');
+
+test('TA sent as a sub-role of Instructor maps to section_instructor, not course_supervisor or student', () => {
+  assert.equal(mapLtiRolesToInternalRole([`${M}/Instructor#TeachingAssistant`]), 'section_instructor');
+  assert.equal(mapLtiRolesToInternalRole([`${M}/Instructor#Grader`]), 'section_instructor');
+});
+
+test('owning Instructor sub-roles (e.g. PrimaryInstructor, Lecturer) map to course_supervisor', () => {
+  assert.equal(mapLtiRolesToInternalRole([`${M}/Instructor#PrimaryInstructor`]), 'course_supervisor');
+  assert.equal(mapLtiRolesToInternalRole([`${M}/Instructor#Lecturer`]), 'course_supervisor');
+});
+
+test('LTI 1.1-style short role names are understood', () => {
+  assert.equal(mapLtiRolesToInternalRole(['Instructor']), 'course_supervisor');
+  assert.equal(mapLtiRolesToInternalRole(['TeachingAssistant']), 'section_instructor');
+  assert.equal(mapLtiRolesToInternalRole(['Learner']), 'student');
+  assert.equal(mapLtiRolesToInternalRole(['Mentor']), 'observer');
+});
+
+test('a Mentor who is not also a Learner is an observer; a Mentor+Learner is a student', () => {
+  assert.equal(mapLtiRolesToInternalRole([`${M}#Mentor`]), 'observer');
+  assert.equal(mapLtiRolesToInternalRole([`${M}/Mentor#Advisor`]), 'observer');
+  assert.equal(mapLtiRolesToInternalRole([`${M}#Mentor`, `${M}#Learner`]), 'student');
+});
+
+test('learner sub-roles stay students', () => {
+  assert.equal(mapLtiRolesToInternalRole([`${M}/Learner#NonCreditLearner`]), 'student');
+});
+
+test('only the two instructor-tier roles count as instructors', () => {
+  assert.equal(isInstructorRole('course_supervisor'), true);
+  assert.equal(isInstructorRole('section_instructor'), true);
+  for (const r of ['student', 'observer', 'dropped', undefined]) assert.equal(isInstructorRole(r), false, String(r));
+});
