@@ -10,7 +10,9 @@
   "scripts": {
     "start": "node server.js",
     "test": "node --test --require ./test/setup.js test/*.test.js",
-    "migrate:sqlite-to-postgres": "node scripts/migrate-sqlite-to-postgres.js"
+    "migrate:sqlite-to-postgres": "node scripts/migrate-sqlite-to-postgres.js",
+    "backup": "node scripts/backup.js",
+    "monitor": "node scripts/monitor.js"
   },
   "dependencies": {
     "cors": "^2.8.5",

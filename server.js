@@ -62,6 +62,7 @@ app.use(require('./src/admin/onboard').router);
 app.use(require('./src/admin/auditView').router);
 app.use(require('./src/admin/keys').router);
 app.use(require('./src/admin/dataRights').router);
+app.use(require('./src/admin/health').router);
 
 // Last resort for errors that escaped a route (see src/util/asyncRoute.js):
 // log the detail, show the user nothing internal.
