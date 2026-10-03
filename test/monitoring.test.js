@@ -86,3 +86,25 @@ test('the monitor alerts when a service is not ready or its summary can\'t be re
   process.env.TENANT_ADMIN_SECRET = saved;
   assert.ok(problems.some((p) => /could not read tutor-service's summary \(HTTP 401\)/.test(p)));
 });
+
+test('the monitor warns at 90% of a school\'s monthly AI cap, and says when the cap is reached', async () => {
+  tutorState.summary = { schools: {
+    'school-low': { ai_errors: 0, chats: 3, grade_push_failures: 0, month_cost_usd: 4.0, monthly_cap_usd: 10 },
+    'school-near': { ai_errors: 0, chats: 3, grade_push_failures: 0, month_cost_usd: 9.2, monthly_cap_usd: 10 },
+    'school-over': { ai_errors: 0, chats: 3, grade_push_failures: 0, month_cost_usd: 10.4, monthly_cap_usd: 10 },
+    'school-nocap': { ai_errors: 0, chats: 3, grade_push_failures: 0, month_cost_usd: 500, monthly_cap_usd: null },
+  } };
+  const problems = await check();
+  assert.ok(problems.some((p) => /school-near: 92% of the monthly AI cap used \(\$9\.20 of \$10\.00\)/.test(p)), problems.join('\n'));
+  assert.ok(problems.some((p) => /school-over: monthly AI cap reached \(\$10\.40 of \$10\.00\) -- the Tutor Bot is refusing/.test(p)));
+  assert.ok(!problems.some((p) => /school-low|school-nocap/.test(p)), 'below the threshold, or no cap: no alert');
+
+  process.env.CAP_ALERT_PCT = '50';
+  try {
+    assert.ok((await check()).some((p) => /school-low: 40%/.test(p)) === false, '40% is still under a 50% threshold');
+    tutorState.summary.schools['school-low'].month_cost_usd = 6;
+    assert.ok((await check()).some((p) => /school-low: 60% of the monthly AI cap used/.test(p)), 'the threshold is a setting');
+  } finally {
+    delete process.env.CAP_ALERT_PCT;
+  }
+});

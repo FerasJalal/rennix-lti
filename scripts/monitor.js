@@ -13,12 +13,17 @@
 //   MONITOR_WINDOW_MINUTES           look-back window (default 10; match the schedule)
 //   MAX_LAUNCH_FAILURES              per school per window before alerting (default 3)
 //   MAX_AI_ERRORS                    per school per window (default 5)
+//   CAP_ALERT_PCT                    warn when a school has spent this % of its
+//                                    monthly AI cap (default 90); schools
+//                                    without a cap are never flagged
 // A grade push failure, a failed roster sync, or a service that is down or not
 // ready always alerts. Prints a report; exits 1 when it alerted, 0 when all is well.
 
 const W = Number(process.env.MONITOR_WINDOW_MINUTES || 10);
 const MAX_LAUNCH_FAILURES = Number(process.env.MAX_LAUNCH_FAILURES || 3);
 const MAX_AI_ERRORS = Number(process.env.MAX_AI_ERRORS || 5);
+const capAlertPct = () => Number(process.env.CAP_ALERT_PCT || 90);
+const usd = (n) => `$${Number(n || 0).toFixed(2)}`;
 const LAUNCH_FAILURES = ['lti_jwt_verification_failed', 'lti_nonce_mismatch', 'lti_deployment_mismatch', 'lti_browser_check_failed'];
 
 async function getJson(url, headers = {}) {
@@ -66,6 +71,15 @@ async function check() {
     for (const [school, s] of Object.entries(r.body.schools)) {
       if (s.ai_errors >= MAX_AI_ERRORS) problems.push(`${school}: ${s.ai_errors} AI errors in ${W} min (${s.chats} chats answered)`);
       if (s.grade_push_failures) problems.push(`${school}: tutor-service could not hand ${s.grade_push_failures} grade(s) to rennix-lti in ${W} min`);
+      // Monthly AI cap: warn before the Tutor Bot stops answering the school's students.
+      if (typeof s.monthly_cap_usd === 'number' && s.monthly_cap_usd > 0 && typeof s.month_cost_usd === 'number') {
+        const pct = Math.round((s.month_cost_usd / s.monthly_cap_usd) * 100);
+        if (pct >= 100) {
+          problems.push(`${school}: monthly AI cap reached (${usd(s.month_cost_usd)} of ${usd(s.monthly_cap_usd)}) -- the Tutor Bot is refusing its students until the cap is raised or the month ends`);
+        } else if (pct >= capAlertPct()) {
+          problems.push(`${school}: ${pct}% of the monthly AI cap used (${usd(s.month_cost_usd)} of ${usd(s.monthly_cap_usd)}) -- the Tutor Bot stops answering at 100%`);
+        }
+      }
       if (s.error) problems.push(`${school}: ${s.error}`);
     }
   } catch (e) {
