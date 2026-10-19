@@ -9,12 +9,31 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+
+    # The tests run against a real Postgres (each test file gets its own
+    # throwaway schema, see test/setup.js).
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: rennix
+          POSTGRES_PASSWORD: rennix-ci
+          POSTGRES_DB: rennix_lti_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U rennix -d rennix_lti_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      DATABASE_URL: postgres://rennix:rennix-ci@localhost:5432/rennix_lti_test
+
     steps:
       - uses: actions/checkout@v4
 
-      # Pinned to Node 20 to match Dockerfile's node:20-alpine and the
-      # `engines` range in package.json -- better-sqlite3's native binary
-      # needs to match whatever Node actually runs this in production.
+      # Pinned to Node 20 to match the Dockerfile's node:20-alpine.
       - uses: actions/setup-node@v4
         with:
           node-version: '20'

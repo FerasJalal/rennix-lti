@@ -2,17 +2,18 @@ const express = require('express');
 const { db } = require('../db');
 const { escapeHtml } = require('../util/html');
 const { requireAdmin } = require('./auth');
+const { asyncRoute } = require('../util/asyncRoute');
 
 const PAGE_SIZE = 50;
 
 const router = express.Router();
 
-router.get('/admin/audit', requireAdmin, (req, res) => {
+router.get('/admin/audit', requireAdmin, asyncRoute(async (req, res) => {
   const page = Math.max(1, parseInt(req.query.page, 10) || 1);
   const offset = (page - 1) * PAGE_SIZE;
 
-  const total = db.prepare('SELECT COUNT(*) AS count FROM admin_audit_log').get().count;
-  const rows = db.prepare('SELECT event, detail, ip, created_at FROM admin_audit_log ORDER BY created_at DESC LIMIT ? OFFSET ?').all(PAGE_SIZE, offset);
+  const total = (await db.one('SELECT COUNT(*) AS count FROM admin_audit_log')).count;
+  const rows = await db.all('SELECT event, detail, ip, created_at FROM admin_audit_log ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?', [PAGE_SIZE, offset]);
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
 
   res.set('Content-Type', 'text/html').send(`<!doctype html>
@@ -52,6 +53,6 @@ router.get('/admin/audit', requireAdmin, (req, res) => {
     </div>
   </div>
 </body></html>`);
-});
+}));
 
 module.exports = { router };

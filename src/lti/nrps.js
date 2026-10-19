@@ -1,9 +1,10 @@
 const crypto = require('crypto');
 const { SignJWT } = require('jose');
 const { getToolKeyPair } = require('../security/toolKeys');
-const { getOrAllocateUserId } = require('../db');
+const { db, getOrAllocateUserId, setMembership, hasActiveMembership, findMappedUserId } = require('../db');
 const { mapLtiRolesToInternalRole } = require('./roles');
 const { logAdminEvent } = require('../audit');
+const log = require('../log');
 const { APP_BASE_URL, TENANT_ADMIN_SECRET } = require('../config');
 
 // ---- LTI Advantage service calls (NRPS today, AGS later reuses the same
@@ -64,34 +65,84 @@ async function getServiceAccessToken(platform, scope) {
 // enrolled at all", instead of only ever knowing about students who happened
 // to launch.
 const NRPS_SCOPE = 'https://purl.imsglobal.org/spec/lti-nrps/scope/contextmembership.readonly';
-async function fetchCourseMembership(membershipsUrl, accessToken) {
-  const resp = await fetch(membershipsUrl, {
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-      Accept: 'application/vnd.ims.lti-nrps.v2.membershipcontainer+json',
-    },
-  });
-  if (!resp.ok) {
-    const text = await resp.text().catch(() => '');
-    throw new Error(`NRPS request failed (${resp.status}): ${text.slice(0, 200)}`);
+// Safety cap on pages followed, so a platform that keeps returning a `next`
+// link can't loop us forever (at typical page sizes this is thousands of members).
+const NRPS_MAX_PAGES = 100;
+
+// The URL of the Link header's rel="next" entry, or null.
+function nextPageUrl(linkHeader, baseUrl) {
+  if (!linkHeader) return null;
+  for (const part of linkHeader.split(',')) {
+    const m = part.match(/<([^>]+)>\s*;(.*)$/);
+    if (m && /\brel\s*=\s*"?next"?/i.test(m[2])) return new URL(m[1].trim(), baseUrl).toString();
   }
-  return resp.json(); // { id, context, members: [{ user_id, roles, status, name, email, ... }] }
+  return null;
+}
+
+// NRPS pages large rosters (Canvas uses small pages by default): the rest of
+// the membership is behind Link: <...>; rel="next". Follows every page and
+// returns the combined container.
+async function fetchCourseMembership(membershipsUrl, accessToken) {
+  let url = membershipsUrl;
+  let container = null;
+  const members = [];
+  for (let page = 0; url && page < NRPS_MAX_PAGES; page++) {
+    const resp = await fetch(url, {
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        Accept: 'application/vnd.ims.lti-nrps.v2.membershipcontainer+json',
+      },
+    });
+    if (!resp.ok) {
+      const text = await resp.text().catch(() => '');
+      throw new Error(`NRPS request failed (${resp.status}): ${text.slice(0, 200)}`);
+    }
+    const data = await resp.json(); // { id, context, members: [{ user_id, roles, status, name, email, ... }] }
+    container = container || data;
+    members.push(...(data.members || []));
+    url = nextPageUrl(resp.headers.get('link'), url);
+  }
+  if (url) log.warn(`[NRPS] stopped after ${NRPS_MAX_PAGES} pages; roster may be incomplete`);
+  // `complete` = every page was read; only then may absence from the roster mean "left".
+  return { ...(container || {}), members, complete: !url };
 }
 
 // Fire-and-forget from /lti/launch -- never blocks the student/instructor's
 // redirect on a roster sync. Pushes the full membership into tutor-service via
 // the same /students/sync endpoint the legacy Moodle-native path uses, so both
 // roster sources land in one place rather than needing two parallel systems.
-async function syncRosterViaNrps(platform, membershipsUrl) {
+// Students who left are kept (history) but taken off the roster: tutor-service
+// lists and bills role 'student' only, and flips 'dropped' back when they
+// return. Platforms signal leaving differently -- Canvas-style rosters list the
+// member with status "Inactive", Moodle's simply stops listing a suspended or
+// unenrolled student -- so both count, the latter only when the whole roster
+// was read. Rosters are per course, so a student is only reported as dropped
+// once they have no active membership in any course of this tenant.
+async function syncRosterViaNrps(platform, membershipsUrl, launchContextId) {
   const accessToken = await getServiceAccessToken(platform, NRPS_SCOPE);
   const data = await fetchCourseMembership(membershipsUrl, accessToken);
   const members = data.members || [];
+  const contextId = String((data.context && data.context.id) || launchContextId || '');
+  const tenant = platform.tenant_key;
+  const issuer = platform.issuer;
 
   const students = [];
+  const leftThisCourse = new Set();
+  const listed = new Set();
+  let skippedObservers = 0;
   for (const m of members) {
-    const roles = m.roles || [];
-    const internalRole = mapLtiRolesToInternalRole(roles);
-    const userid = await getOrAllocateUserId(platform.tenant_key, platform.issuer, m.user_id, m.email);
+    const subject = String(m.user_id);
+    listed.add(subject);
+    const internalRole = mapLtiRolesToInternalRole(m.roles || []);
+    // Observers have no Rennix account (see launch.js) -- not synced, not billed.
+    if (internalRole === 'observer') { skippedObservers += 1; continue; }
+    if (m.status === 'Inactive') {
+      if (contextId) await setMembership(tenant, issuer, contextId, subject, false);
+      leftThisCourse.add(subject);
+      continue;
+    }
+    if (contextId) await setMembership(tenant, issuer, contextId, subject, true);
+    const userid = await getOrAllocateUserId(tenant, issuer, m.user_id, m.email);
     students.push({
       userid,
       username: m.email ? m.email.split('@')[0] : `nrps-${m.user_id}`,
@@ -99,6 +150,25 @@ async function syncRosterViaNrps(platform, membershipsUrl) {
       email: m.email || null,
       role: internalRole,
     });
+  }
+  // Previously active here but no longer listed in a complete roster -> left this course.
+  if (contextId && data.complete) {
+    const wasActive = await db.all(
+      'SELECT subject FROM lti_memberships WHERE tenant_key = ? AND platform_issuer = ? AND context_id = ? AND active = 1',
+      [tenant, issuer, contextId]);
+    for (const { subject } of wasActive) {
+      if (!listed.has(subject)) { await setMembership(tenant, issuer, contextId, subject, false); leftThisCourse.add(subject); }
+    }
+  }
+  // Report as dropped only those with no active membership left anywhere, and
+  // only people who actually have a Rennix account (never create one for them).
+  let dropped = 0;
+  for (const subject of leftThisCourse) {
+    if (await hasActiveMembership(tenant, issuer, subject)) continue;
+    const mappedId = await findMappedUserId(tenant, issuer, subject);
+    if (!mappedId) continue;
+    students.push({ userid: mappedId, username: `lti-${mappedId}`, fullname: null, email: null, role: 'dropped' });
+    dropped += 1;
   }
 
   if (!TENANT_ADMIN_SECRET) {
@@ -113,7 +183,8 @@ async function syncRosterViaNrps(platform, membershipsUrl) {
     const text = await resp.text().catch(() => '');
     throw new Error(`tutor-service /students/sync returned ${resp.status}: ${text.slice(0, 200)}`);
   }
-  logAdminEvent('nrps_roster_synced', `tenant=${platform.tenant_key} members=${students.length}`, null);
+  logAdminEvent('nrps_roster_synced',
+    `tenant=${platform.tenant_key} members=${students.length} dropped=${dropped} observers_skipped=${skippedObservers}`, null);
 }
 
-module.exports = { getServiceAccessToken, fetchCourseMembership, syncRosterViaNrps, NRPS_SCOPE };
+module.exports = { getServiceAccessToken, fetchCourseMembership, syncRosterViaNrps, nextPageUrl, NRPS_SCOPE };

@@ -32,12 +32,20 @@ it reports `http` behind Caddy, breaking `redirect_uri` matching.
 ## Setup
 
 ```bash
-cp .env.example .env   # set ADMIN_SECRET, SESSION_SECRET, and KEY_ENCRYPTION_SECRET to real random values
+cp .env.example .env   # set ADMIN_SECRET, SESSION_SECRET, KEY_ENCRYPTION_SECRET and POSTGRES_PASSWORD to real random values
 docker compose up -d --build
 ```
 
-Admin pages: `/admin` (onboard/manage platforms) and `/admin/audit` (audit log), both behind
-`/admin/login`.
+This starts the tool and its Postgres database. The schema is created on first start.
+
+Admin pages, all behind `/admin/login`:
+- `/admin`: onboard and manage platforms.
+- `/admin/keys`: this tool's signing keys (see "Signing keys" below).
+- `/admin/audit`: the audit log.
+
+Running outside Docker (`npm start`, `npm test`) needs `DATABASE_URL` pointing at a Postgres you
+can create schemas in. `npm test` gives every test file its own throwaway schema and drops it
+afterwards.
 
 ## Registering a platform
 
@@ -69,14 +77,75 @@ curl -X POST https://<this-service>/admin/platforms \
     "clientId": "<from their LMS admin External Tool config>",
     "deploymentId": "<from their LMS admin External Tool config>",
     "authLoginUrl": "https://edu.rennix.ai/mod/lti/auth.php",
+    "authTokenUrl": "https://edu.rennix.ai/mod/lti/token.php",
     "jwksUrl": "https://edu.rennix.ai/mod/lti/certs.php"
   }'
 ```
 
+`authTokenUrl` (Moodle's "Access token URL") is optional for launches but required for NRPS roster
+sync and AGS grade push -- without it both fail with "no auth_token_url registered". Platforms
+registered before this field existed can be fixed from the **Edit** link on `/admin`.
+
 ## Data
 
-SQLite (`better-sqlite3`), persisted via the `lti_data` Docker volume — just platform
-registrations and short-lived login state/nonces, nothing else.
+Postgres (`pg`), set by `DATABASE_URL` (the `postgres` service in `docker-compose.yml`, data in
+the `lti_pgdata` volume). It holds:
+- platform registrations and deployments
+- the LTI-user to Rennix-userid mappings (students keep their history through these, so back up
+  this database)
+- the signing keys
+- AGS line items and course memberships
+- rate-limit counters
+- the admin audit log
+- short-lived login, Deep Linking and registration sessions
+
+Because all shared state is in Postgres, more than one instance can run against the same database.
+
+### Moving from SQLite (existing deployments, run once)
+
+Older versions kept everything in SQLite at `/data/lti.db`. After upgrading, copy it across once
+before sending launches to the new version:
+
+```bash
+docker compose up -d postgres
+docker compose run --rm lti npm run migrate:sqlite-to-postgres
+docker compose up -d
+```
+
+The script:
+- copies platforms (with their original ids), deployments, user mappings, the userid counter, the
+  signing key, AGS endpoints, memberships and the audit log, all in one transaction
+- checks the row counts, and commits nothing if they don't match
+- refuses to run into a database that already has platforms or users (pass `--into-non-empty` to
+  override)
+
+Short-lived login sessions are not copied; a launch that is in progress during the switch just
+has to be retried. The old signing key stays the active one, so schools don't need to change
+anything. Keep `lti.db` until you've checked a launch and a grade push on the new version.
+
+## Signing keys
+
+Platforms check everything this tool signs (Deep Linking responses, and the client assertions
+behind roster sync and grade push) against `/lti/jwks`. Each key goes through four states:
+
+| State | Signs? | In `/lti/jwks`? |
+|---|---|---|
+| next | no | yes, published ahead of time so platforms already know it |
+| active | yes (exactly one) | yes |
+| retired | no | yes, until its grace period ends |
+| removed | no | no |
+
+- **Automatic rotation.** Every instance checks hourly. When the active key is
+  `KEY_ROTATION_DAYS` old (default 90), the next key becomes active and the old one is retired for
+  `KEY_RETIRED_GRACE_HOURS` (default 24). Nothing a platform has cached breaks, and a Postgres
+  advisory lock means only one instance rotates.
+- **"Rotate key now"** on `/admin/keys` does the same thing on demand.
+- **"Emergency: replace all keys"** (requires a confirmation tick) is for a key that may have
+  leaked. Every stored key, including the pre-published next one, is treated as compromised: a
+  brand-new key starts signing and all old keys leave `/lti/jwks` at once. Platforms that cached
+  the old JWKS pick up the new key when they re-fetch; `/lti/jwks` is cacheable for 5 minutes.
+
+Every rotation is written to the audit log (`tool_key_rotated`).
 
 ## How a verified launch reaches the real app
 
@@ -148,29 +217,30 @@ automatically).
 `server.js` is only the composition root (middleware + router mounting + listen). The actual
 routes and business logic live in `src/`:
 
-- `src/config.js`, `src/db.js`, `src/audit.js` -- shared config, SQLite schema/access, admin audit
+- `src/config.js`, `src/db.js`, `src/audit.js` -- shared config, Postgres schema/access, admin audit
   logging.
 - `src/security/` -- token signing/verification (bridge token, admin session, this tool's own
-  RS256 key pair for signing outbound JWTs).
-- `src/rateLimit.js` -- in-memory per-process rate limiting (single-instance only, see below).
+  RS256 signing keys and their rotation, `src/security/toolKeys.js`).
+- `src/rateLimit.js` -- fixed-window rate limiting, counted in Postgres so it holds across instances.
 - `src/lti/` -- the LTI protocol itself: login, launch/verification, Deep Linking, Dynamic
   Registration, NRPS roster sync, AGS score push, role mapping, and the cached-per-platform JWKS
   lookup.
-- `src/admin/` -- the admin auth/session, platform registration API, and onboarding UI.
+- `src/admin/` -- the admin auth/session, platform registration API, onboarding UI and the
+  signing-keys page.
+- `scripts/migrate-sqlite-to-postgres.js` -- the one-time move from the old SQLite database.
 
-Run `npm test` (Node's built-in test runner, `test/`) to exercise the JWT verification, nonce/
+Run `npm test` (Node's built-in test runner, `test/`; needs `DATABASE_URL`, see Setup) to exercise the JWT verification, nonce/
 replay, deployment-id, and role-mapping logic end-to-end against a locally generated key pair --
 no real LMS needed for that layer.
 
 ## Known limitations
 
-- **Single-instance only.** Rate-limit buckets (`src/rateLimit.js`) and the NRPS/AGS service-token
-  cache (`src/lti/nrps.js`) are in-memory per process, same as the SQLite database itself (a local
-  Docker volume, not a shared store). None of this is safe to run as multiple replicas behind a
-  load balancer without moving all three to a shared store together.
+- **Multiple instances are possible but untested in production.** All shared state (data, rate
+  limits, signing keys) is in Postgres. The only per-process state left is the NRPS/AGS
+  service-token cache (`src/lti/nrps.js`), which just means each instance fetches its own token.
 - The four cross-service secrets (`ADMIN_SECRET`, `SESSION_SECRET`, `LTI_BRIDGE_SECRET`,
-  `TENANT_ADMIN_SECRET`) are still plain env vars -- no secrets manager or rotation story yet. This
-  tool's own RSA private key, the one thing actually persisted to disk, is encrypted at rest when
+  `TENANT_ADMIN_SECRET`) are still plain env vars -- no secrets manager or rotation story yet (unlike the
+  signing keys, which rotate, see above). The signing keys' private halves are encrypted at rest when
   `KEY_ENCRYPTION_SECRET` is set (see `src/security/keyEncryption.js`); it stays plaintext if that
   var is left unset, with a startup warning.
 

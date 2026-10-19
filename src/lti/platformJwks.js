@@ -16,4 +16,10 @@ function getPlatformJwks(platform) {
   return jwks;
 }
 
-module.exports = { getPlatformJwks };
+// Called when an admin edits a platform's issuer/JWKS URL -- the cached key
+// set would otherwise keep verifying against the old endpoint until restart.
+function forgetPlatformJwks(platformId) {
+  platformJwksCache.delete(Number(platformId));
+}
+
+module.exports = { getPlatformJwks, forgetPlatformJwks };

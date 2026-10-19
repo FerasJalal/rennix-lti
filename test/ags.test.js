@@ -3,14 +3,12 @@
 // NRPS), the lineitems collection endpoint, and per-lineitem scores
 // endpoints, so we can assert on exactly what gets sent.
 
-const os = require('os');
 const path = require('path');
 const http = require('http');
 const crypto = require('crypto');
 const { test, before, after, beforeEach } = require('node:test');
 const assert = require('node:assert/strict');
 
-process.env.DB_PATH = path.join(os.tmpdir(), `lti-ags-test-${crypto.randomBytes(6).toString('hex')}.db`);
 process.env.ADMIN_SECRET = 'test-admin-secret';
 process.env.SESSION_SECRET = 'test-session-secret';
 process.env.LTI_BRIDGE_SECRET = 'test-bridge-secret';
@@ -109,7 +107,7 @@ beforeEach(() => {
 });
 
 async function registerFakePlatform(clientId, tenantKey) {
-  registerPlatform({
+  await registerPlatform({
     product: 'tutor_bot', tenantKey, tenantName: tenantKey,
     issuer: `http://127.0.0.1:${platformPort}`, clientId, deploymentId: 'deploy-1',
     authLoginUrl: `http://127.0.0.1:${platformPort}/auth`, authTokenUrl: `http://127.0.0.1:${platformPort}/token`,
@@ -136,7 +134,7 @@ async function launch(platform, { resourceLinkId, agsClaim, userid }) {
   const idToken = await new SignJWT(claims)
     .setProtectedHeader({ alg: 'RS256', kid: KID }).setIssuer(platform.issuer).setAudience(platform.client_id)
     .setIssuedAt(now).setExpirationTime(now + 300).sign(privateKey);
-  return request({ port: appPort, method: 'POST', path: '/lti/launch', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id_token: idToken, state: loc.searchParams.get('state') }) });
+  return request({ port: appPort, method: 'POST', path: '/lti/launch', headers: { 'Content-Type': 'application/json', Cookie: `lti_state_${loc.searchParams.get('state')}=1` }, body: JSON.stringify({ id_token: idToken, state: loc.searchParams.get('state') }) });
 }
 
 // The LTI `sub` claim used as `launch()`'s `userid` is the platform's own
@@ -145,8 +143,8 @@ async function launch(platform, { resourceLinkId, agsClaim, userid }) {
 // lti_user_map. /ags/score's userid param is the tutor-service one, so tests
 // that push a score for a student who really did launch need to resolve it
 // back out rather than reusing the subject string.
-function allocatedUserId(tenantKey, issuer, subject) {
-  const row = db.prepare('SELECT userid FROM lti_user_map WHERE tenant_key = ? AND platform_issuer = ? AND subject = ?').get(tenantKey, issuer, subject);
+async function allocatedUserId(tenantKey, issuer, subject) {
+  const row = await db.one('SELECT userid FROM lti_user_map WHERE tenant_key = ? AND platform_issuer = ? AND subject = ?', [tenantKey, issuer, subject]);
   return row && row.userid;
 }
 
@@ -166,7 +164,7 @@ test('a launch with an AGS endpoint claim (direct lineitem) creates an ags_linei
     agsClaim: { scope: ['https://purl.imsglobal.org/spec/lti-ags/scope/score'], lineitem: `http://127.0.0.1:${platformPort}/lineitem-fixed` },
   });
   assert.equal(res.statusCode, 303);
-  const row = db.prepare('SELECT * FROM ags_lineitems WHERE resource_link_id = ?').get('rl-with-lineitem');
+  const row = await db.one('SELECT * FROM ags_lineitems WHERE resource_link_id = ?', ['rl-with-lineitem']);
   assert.ok(row);
   assert.equal(row.lineitem_url, `http://127.0.0.1:${platformPort}/lineitem-fixed`);
   assert.equal(row.tenant_key, 'ags-tenant-1');
@@ -176,7 +174,7 @@ test('a launch without an AGS claim leaves no row, and a score push against it 4
   const platform = await registerFakePlatform('ags-client-2', 'ags-tenant-2');
   const res = await launch(platform, { resourceLinkId: 'rl-no-ags', userid: 'student-2' });
   assert.equal(res.statusCode, 303);
-  const row = db.prepare('SELECT * FROM ags_lineitems WHERE resource_link_id = ?').get('rl-no-ags');
+  const row = await db.one('SELECT * FROM ags_lineitems WHERE resource_link_id = ?', ['rl-no-ags']);
   assert.equal(row, undefined);
 
   const pushRes = await pushScore({ tenant: 'ags-tenant-2', userid: 'student-2', resourceLinkId: 'rl-no-ags', score: 5, scoreMaximum: 10, secret: process.env.TENANT_ADMIN_SECRET });
@@ -189,7 +187,7 @@ test('POST /ags/score with an existing lineitem_url pushes directly, no line-ite
     resourceLinkId: 'rl-direct', userid: 'student-3',
     agsClaim: { scope: [], lineitem: `http://127.0.0.1:${platformPort}/lineitem-fixed` },
   });
-  const userid = allocatedUserId('ags-tenant-3', platform.issuer, 'student-3');
+  const userid = await allocatedUserId('ags-tenant-3', platform.issuer, 'student-3');
   assert.ok(userid, 'expected the launch to have allocated a userid');
 
   const res = await pushScore({ tenant: 'ags-tenant-3', userid, resourceLinkId: 'rl-direct', score: 8, scoreMaximum: 10, secret: process.env.TENANT_ADMIN_SECRET });
@@ -210,7 +208,7 @@ test('POST /ags/score with only a lineitems collection URL auto-creates a line i
     resourceLinkId: 'rl-lazy', userid: 'student-4',
     agsClaim: { scope: [], lineitems: `http://127.0.0.1:${platformPort}/lineitems` },
   });
-  const userid = allocatedUserId('ags-tenant-4', platform.issuer, 'student-4');
+  const userid = await allocatedUserId('ags-tenant-4', platform.issuer, 'student-4');
 
   const first = await pushScore({ tenant: 'ags-tenant-4', userid, resourceLinkId: 'rl-lazy', score: 3, scoreMaximum: 10, secret: process.env.TENANT_ADMIN_SECRET });
   assert.equal(first.statusCode, 200);
@@ -220,7 +218,7 @@ test('POST /ags/score with only a lineitems collection URL auto-creates a line i
   // URL's own query string.
   assert.equal(capturedScoresRequests[0].path, `${createdLineItemPath}/scores?type_id=1`);
 
-  const row = db.prepare('SELECT lineitem_url FROM ags_lineitems WHERE resource_link_id = ?').get('rl-lazy');
+  const row = await db.one('SELECT lineitem_url FROM ags_lineitems WHERE resource_link_id = ?', ['rl-lazy']);
   assert.equal(row.lineitem_url, `http://127.0.0.1:${platformPort}${createdLineItemPath}?type_id=1`);
 
   const second = await pushScore({ tenant: 'ags-tenant-4', userid, resourceLinkId: 'rl-lazy', score: 7, scoreMaximum: 10, secret: process.env.TENANT_ADMIN_SECRET });

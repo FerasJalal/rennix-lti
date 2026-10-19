@@ -1,6 +1,13 @@
 const path = require('path');
 
 const PORT = process.env.PORT || 3002;
+// Postgres connection, e.g. postgres://rennix:secret@localhost:5432/rennix_lti.
+// Every piece of state lives there (platforms, user ids, keys, login states,
+// rate limits), so any number of instances can run behind a load balancer.
+const DATABASE_URL = process.env.DATABASE_URL || 'postgres://localhost:5432/rennix_lti';
+// Optional Postgres schema to use instead of "public" (tests give each file its own).
+const DB_SCHEMA = process.env.DB_SCHEMA || '';
+// The pre-Postgres SQLite file -- only read by scripts/migrate-sqlite-to-postgres.js.
 const DB_PATH = process.env.DB_PATH || path.join(__dirname, '..', 'data', 'lti.db');
 const ADMIN_SECRET = process.env.ADMIN_SECRET || '';
 const SESSION_SECRET = process.env.SESSION_SECRET || require('crypto').randomBytes(32).toString('hex');
@@ -16,7 +23,7 @@ const LTI_BRIDGE_SECRET = process.env.LTI_BRIDGE_SECRET || '';
 // service makes (tenant-user lookup, roster sync, onboarding's OpenAI-key set).
 const TENANT_ADMIN_SECRET = process.env.TENANT_ADMIN_SECRET || '';
 // Optional -- wraps the tool's own RSA private key (src/security/toolKeys.js)
-// before it's stored in SQLite. Not required so that existing deployments
+// before it's stored in the database. Not required so that existing deployments
 // don't break by redeploying without it set first: unset, the key stays
 // plaintext at rest (as before); set, new keys are encrypted and any
 // existing plaintext key gets transparently re-encrypted in place.
@@ -30,5 +37,5 @@ if (!KEY_ENCRYPTION_SECRET) {
 }
 
 module.exports = {
-  PORT, DB_PATH, ADMIN_SECRET, SESSION_SECRET, APP_BASE_URL, LTI_BRIDGE_SECRET, TENANT_ADMIN_SECRET, KEY_ENCRYPTION_SECRET,
+  PORT, DATABASE_URL, DB_SCHEMA, DB_PATH, ADMIN_SECRET, SESSION_SECRET, APP_BASE_URL, LTI_BRIDGE_SECRET, TENANT_ADMIN_SECRET, KEY_ENCRYPTION_SECRET,
 };

@@ -1,5 +1,6 @@
 const express = require('express');
-const { db, getAgsLineItem, setAgsLineItemUrl } = require('../db');
+const { asyncRoute } = require('../util/asyncRoute');
+const { db, getAgsLineItem, setAgsLineItemUrl, getPlatformById } = require('../db');
 const { getServiceAccessToken } = require('./nrps');
 const { logAdminEvent } = require('../audit');
 const { TENANT_ADMIN_SECRET } = require('../config');
@@ -80,13 +81,16 @@ const router = express.Router();
 // (Assignment and Grade Services)" section for the full spec. Not called
 // from anywhere in this repo; tutor-service is expected to call this when it
 // decides a score is ready to report. ----
-router.post('/ags/score', requireTenantAdmin, async (req, res) => {
+router.post('/ags/score', requireTenantAdmin, asyncRoute(async (req, res) => {
   const { tenant, userid, resourceLinkId, score, scoreMaximum, label, activityProgress, gradingProgress } = req.body || {};
   if (!tenant || !userid || !resourceLinkId || score == null || scoreMaximum == null) {
     return res.status(400).json({ error: 'Missing tenant, userid, resourceLinkId, score, or scoreMaximum.' });
   }
+  if (!Number.isFinite(Number(score)) || !Number.isFinite(Number(scoreMaximum)) || Number(scoreMaximum) <= 0) {
+    return res.status(400).json({ error: 'score and scoreMaximum must be numbers, scoreMaximum above 0.' });
+  }
 
-  const lineItemRow = getAgsLineItem(resourceLinkId);
+  const lineItemRow = await getAgsLineItem(resourceLinkId);
   if (!lineItemRow) {
     return res.status(404).json({ error: 'Unknown resourceLinkId -- either this platform never granted AGS, or the activity was never launched.' });
   }
@@ -95,11 +99,13 @@ router.post('/ags/score', requireTenantAdmin, async (req, res) => {
     return res.status(403).json({ error: 'tenant does not match the tenant this resourceLinkId belongs to.' });
   }
 
-  const platform = db.prepare('SELECT * FROM platforms WHERE id = ?').get(lineItemRow.platform_id);
+  const platform = await getPlatformById(lineItemRow.platform_id);
   if (!platform) return res.status(404).json({ error: 'Platform no longer registered.' });
 
-  const userMap = db.prepare('SELECT subject FROM lti_user_map WHERE tenant_key = ? AND platform_issuer = ? AND userid = ?')
-    .get(tenant, platform.issuer, userid);
+  // Rennix user ids are integers; anything else can't belong to a student.
+  const userMap = /^\d+$/.test(String(userid))
+    ? await db.one('SELECT subject FROM lti_user_map WHERE tenant_key = ? AND platform_issuer = ? AND userid = ?', [tenant, platform.issuer, Number(userid)])
+    : null;
   if (!userMap) {
     return res.status(400).json({ error: 'This student has no recorded LTI launch for this platform -- no subject to attribute the score to.' });
   }
@@ -113,7 +119,7 @@ router.post('/ags/score', requireTenantAdmin, async (req, res) => {
       lineitemUrl = await createLineItem(platform, lineItemRow.lineitems_url, {
         scoreMaximum, label: label || platform.tenant_name, resourceLinkId,
       });
-      setAgsLineItemUrl(resourceLinkId, lineitemUrl);
+      await setAgsLineItemUrl(resourceLinkId, lineitemUrl);
     }
 
     await pushScore(platform, lineitemUrl, {
@@ -126,6 +132,6 @@ router.post('/ags/score', requireTenantAdmin, async (req, res) => {
     logAdminEvent('ags_score_push_failed', `tenant=${tenant} resource_link_id=${resourceLinkId} error=${err.message}`, req);
     res.status(502).json({ error: 'Pushing the score to the platform failed.' });
   }
-});
+}));
 
 module.exports = { router, requireTenantAdmin, AGS_SCOPES, AGS_LINEITEM_SCOPE, AGS_SCORE_SCOPE, createLineItem, pushScore };

@@ -1,15 +1,16 @@
 const express = require('express');
 const { jwtVerify } = require('jose');
 const { db } = require('../db');
-const { getOrAllocateUserId, isKnownDeployment, addDeployment, upsertAgsEndpoint } = require('../db');
+const { getOrAllocateUserId, getPlatformById, isKnownDeployment, addDeployment, upsertAgsEndpoint, setMembership } = require('../db');
 const { logAdminEvent } = require('../audit');
 const { rateLimit } = require('../rateLimit');
 const { escapeHtml } = require('../util/html');
 const { signBridgeToken } = require('../security/tokens');
-const { mapLtiRolesToInternalRole } = require('./roles');
+const { mapLtiRolesToInternalRole, isInstructorRole } = require('./roles');
 const { getPlatformJwks } = require('./platformJwks');
 const { handleDeepLinkingRequest } = require('./deepLinking');
 const { syncRosterViaNrps } = require('./nrps');
+const { hasStateCookie, clearStateCookie, relaunchUrl, fallbackPage } = require('./browserBinding');
 const log = require('../log');
 const { APP_BASE_URL } = require('../config');
 
@@ -26,6 +27,64 @@ function launchErrorMessage(err) {
   return `Launch verification failed: ${err.message}`;
 }
 
+// The activity kind carried to tutor-service (display/grade routing only).
+function activityFromCustom(custom) {
+  const view = ['chat', 'knowledge_check'].includes(custom.rennix_view) ? custom.rennix_view : null;
+  const pdfId = /^\d+$/.test(String(custom.rennix_pdf_id || '')) ? Number(custom.rennix_pdf_id) : null;
+  return {
+    view: pdfId ? 'pdf' : view,
+    lectureId: custom.rennix_lecture_id ? String(custom.rennix_lecture_id).slice(0, 100) : null,
+    pdfId,
+  };
+}
+
+// How the platform opened us (LTI launch_presentation claim). return_url is
+// where "Back to course" goes; only http(s) is accepted, so a signed-but-odd
+// value can't become a javascript: link. document_target is 'iframe',
+// 'frame' or 'window'.
+function presentationFrom(payload) {
+  const lp = payload['https://purl.imsglobal.org/spec/lti/claim/launch_presentation'] || {};
+  let returnUrl = null;
+  try {
+    const u = new URL(String(lp.return_url || ''));
+    if (u.protocol === 'http:' || u.protocol === 'https:') returnUrl = u.toString();
+  } catch (e) { /* no usable return_url */ }
+  const documentTarget = ['iframe', 'frame', 'window'].includes(lp.document_target) ? lp.document_target : null;
+  return { returnUrl, documentTarget };
+}
+
+// The return URL with a message for the platform to show on arrival (LTI's
+// lti_msg / lti_errormsg query parameters; Moodle displays them).
+function returnUrlWith(returnUrl, key, message) {
+  if (!returnUrl) return null;
+  const u = new URL(returnUrl);
+  u.searchParams.set(key, message);
+  return u.toString();
+}
+
+// A plain explanation page shown instead of the app (all inputs are escaped),
+// with a "Back to course" button when the platform gave us a return URL.
+// target=_top: framed in the LMS, the course page replaces the whole LMS page,
+// not just the iframe.
+function infoPage(title, message, returnUrl = null) {
+  return `<!doctype html>
+<html><head><meta charset="utf-8"><title>${escapeHtml(title)}</title>
+<style>
+  body { font-family: -apple-system, "Segoe UI", Roboto, Arial, sans-serif; background:#f7f8fa; margin:0; padding:40px; }
+  .card { max-width:440px; margin:0 auto; background:#fff; border:1px solid #e2e8f0; border-radius:12px; padding:28px; text-align:center; }
+  h1 { font-size:17px; margin:0 0 8px; color:#1a1a1a; }
+  p { color:#57606a; font-size:13px; line-height:1.6; margin:0; }
+  a.btn { display:inline-block; margin-top:18px; background:#d41128; color:#fff; text-decoration:none; font-weight:700; font-size:13px; padding:10px 18px; border-radius:8px; }
+</style></head>
+<body>
+  <div class="card">
+    <h1>${escapeHtml(title)}</h1>
+    <p>${escapeHtml(message)}</p>
+    ${returnUrl ? `<a class="btn" href="${escapeHtml(returnUrl)}" target="_top">Back to course</a>` : ''}
+  </div>
+</body></html>`;
+}
+
 const router = express.Router();
 
 // ---- Step 2: launch -- verify the platform's signed id_token ----
@@ -34,11 +93,15 @@ router.post('/lti/launch', rateLimit('lti-launch', 30, 60 * 1000), async (req, r
     const { id_token, state } = req.body;
     if (!id_token || !state) return res.status(400).send('Missing id_token or state.');
 
-    const stateRow = db.prepare('SELECT * FROM lti_states WHERE state = ?').get(state);
+    // Single-use, atomically: whoever deletes the row owns the launch, so the
+    // same state can't be redeemed twice even across instances.
+    const stateRow = (await db.run('DELETE FROM lti_states WHERE state = ? RETURNING *', [String(state)])).rows[0];
     if (!stateRow) return res.status(400).send('Unknown or expired state -- restart the launch from your LMS.');
-    db.prepare('DELETE FROM lti_states WHERE state = ?').run(state); // single-use
+    // Checked below, once the id_token is verified; spent either way.
+    const browserStartedLaunch = hasStateCookie(req, stateRow.state);
+    clearStateCookie(res, stateRow.state);
 
-    const platform = db.prepare('SELECT * FROM platforms WHERE id = ?').get(stateRow.platform_id);
+    const platform = await getPlatformById(stateRow.platform_id);
     if (!platform) return res.status(400).send('Platform no longer registered.');
 
     const jwks = getPlatformJwks(platform);
@@ -51,14 +114,24 @@ router.post('/lti/launch', rateLimit('lti-launch', 30, 60 * 1000), async (req, r
       logAdminEvent('lti_nonce_mismatch', `platform_id=${platform.id} tenant=${platform.tenant_key}`, req);
       return res.status(400).send('Nonce mismatch -- possible replay, rejecting launch.');
     }
+    const presentation = presentationFrom(payload);
+    // The launch must finish in the browser that started it (see browserBinding.js).
+    if (!browserStartedLaunch) {
+      logAdminEvent('lti_browser_check_failed', `platform_id=${platform.id} tenant=${platform.tenant_key} target=${presentation.documentTarget || 'unknown'}`, req);
+      return res.set('Content-Type', 'text/html').status(403).send(fallbackPage({
+        openUrl: relaunchUrl(platform, stateRow.lti_message_hint),
+        returnUrl: presentation.returnUrl,
+      }));
+    }
     const messageType = payload['https://purl.imsglobal.org/spec/lti/claim/message_type'];
     const ltiVersion = payload['https://purl.imsglobal.org/spec/lti/claim/version'];
     const deploymentId = payload['https://purl.imsglobal.org/spec/lti/claim/deployment_id'];
     if (ltiVersion !== '1.3.0' || !['LtiResourceLinkRequest', 'LtiDeepLinkingRequest'].includes(messageType)) {
       logAdminEvent('lti_unsupported_message', `type=${messageType} version=${ltiVersion} platform_id=${platform.id}`, req);
-      return res.status(400).send(`Unsupported LTI message (type=${messageType}, version=${ltiVersion}).`);
+      const why = `Unsupported LTI message (type=${messageType}, version=${ltiVersion}).`;
+      return res.set('Content-Type', 'text/html').status(400).send(infoPage('Rennix can\'t open this', why, returnUrlWith(presentation.returnUrl, 'lti_errormsg', why)));
     }
-    if (!isKnownDeployment(platform.id, deploymentId)) {
+    if (!(await isKnownDeployment(platform.id, deploymentId))) {
       // Dynamic Registration doesn't always learn a deployment_id upfront
       // (Canvas typically doesn't; Moodle typically does) -- for platforms
       // that came in that way, the first deployment_id seen inside an
@@ -67,17 +140,32 @@ router.post('/lti/launch', rateLimit('lti-launch', 30, 60 * 1000), async (req, r
       // behavior: matching a specific deployment_id the admin copied from
       // their LMS is itself a meaningful confirmation step for those.
       if (platform.dynamic_registration) {
-        addDeployment(platform.id, deploymentId);
+        await addDeployment(platform.id, deploymentId);
         logAdminEvent('deployment_auto_registered', `platform_id=${platform.id} tenant=${platform.tenant_key} deployment_id=${deploymentId}`, req);
       } else {
         logAdminEvent('lti_deployment_mismatch', `platform_id=${platform.id} tenant=${platform.tenant_key} deployment_id=${deploymentId}`, req);
-        return res.status(400).send('Deployment ID does not match this platform\'s registration.');
+        const why = 'This Rennix connection isn\'t set up for this part of the LMS (deployment ID mismatch). Ask your LMS administrator to check the Rennix tool registration.';
+        return res.set('Content-Type', 'text/html').status(400).send(infoPage('Rennix isn\'t set up here', why, returnUrlWith(presentation.returnUrl, 'lti_errormsg', why)));
       }
     }
 
     const roles = payload['https://purl.imsglobal.org/spec/lti/claim/roles'] || [];
     const internalRole = mapLtiRolesToInternalRole(roles);
-    const isInstructor = internalRole !== 'student';
+    // Strictly the two instructor-tier roles -- not "anything that isn't a
+    // student", which would hand instructor access to observers.
+    const isInstructor = isInstructorRole(internalRole);
+
+    // Mentors/observers (parents, advisors) have no Rennix view yet. Say so
+    // plainly instead of letting them in as students (which would also bill
+    // them as students).
+    if (internalRole === 'observer') {
+      logAdminEvent('lti_observer_blocked', `tenant=${platform.tenant_key} product=${platform.product}`, req);
+      return res.set('Content-Type', 'text/html').status(403).send(infoPage(
+        'Not available for observers yet',
+        'Rennix is signed in as an observer (for example a parent or advisor) for this course. An observer view is on the way; until then, Rennix is available to the course\'s students and instructors.',
+        presentation.returnUrl
+      ));
+    }
 
     // Deep Linking: the platform is asking the instructor to pick content
     // *inside* Rennix, not launching an already-created activity -- a
@@ -85,11 +173,14 @@ router.post('/lti/launch', rateLimit('lti-launch', 30, 60 * 1000), async (req, r
     // POSTed back to Moodle, not a redirect into the app). Branches off
     // before any of the resource-link-specific handling below.
     if (messageType === 'LtiDeepLinkingRequest') {
-      return handleDeepLinkingRequest(req, res, payload, platform, isInstructor);
+      return await handleDeepLinkingRequest(req, res, payload, platform, isInstructor);
     }
 
     const context = payload['https://purl.imsglobal.org/spec/lti/claim/context'] || {};
     const resourceLink = payload['https://purl.imsglobal.org/spec/lti/claim/resource_link'] || {};
+    // Custom parameters set on the activity (Deep Linking or the instructor):
+    // rennix_view, rennix_lecture_id, rennix_pdf_id.
+    const customClaim = payload['https://purl.imsglobal.org/spec/lti/claim/custom'] || {};
 
     const identity = {
       product: platform.product,
@@ -101,6 +192,7 @@ router.post('/lti/launch', rateLimit('lti-launch', 30, 60 * 1000), async (req, r
       role: isInstructor ? 'instructor' : 'student',
       courseId: context.id || null,
       courseTitle: context.title || context.label || null,
+      courseLabel: context.label || null,
       resourceLinkId: resourceLink.id || null,
     };
 
@@ -112,26 +204,19 @@ router.post('/lti/launch', rateLimit('lti-launch', 30, 60 * 1000), async (req, r
     // separate, instructor-only tool.
     if (platform.product === 'analytics' && !isInstructor) {
       logAdminEvent('lti_analytics_blocked_student', `tenant=${platform.tenant_key}`, req);
-      return res.set('Content-Type', 'text/html').status(403).send(`<!doctype html>
-<html><head><meta charset="utf-8"><title>Instructor access only</title>
-<style>
-  body { font-family: -apple-system, "Segoe UI", Roboto, Arial, sans-serif; background:#f7f8fa; margin:0; padding:40px; }
-  .card { max-width:440px; margin:0 auto; background:#fff; border:1px solid #e2e8f0; border-radius:12px; padding:28px; text-align:center; }
-  h1 { font-size:17px; margin:0 0 8px; color:#1a1a1a; }
-  p { color:#57606a; font-size:13px; line-height:1.6; margin:0; }
-</style></head>
-<body>
-  <div class="card">
-    <h1>Instructor access only</h1>
-    <p>Rennix Analytics is an instructor tool. Your account (${escapeHtml(identity.name)}) is signed in as a student in this course, so there's nothing to show here.</p>
-  </div>
-</body></html>`);
+      return res.set('Content-Type', 'text/html').status(403).send(infoPage(
+        'Instructor access only',
+        `Rennix Analytics is an instructor tool. Your account (${identity.name}) is signed in as a student in this course, so there's nothing to show here.`,
+        presentation.returnUrl
+      ));
     }
 
     // Hand off into the actual product: mint the signed bridge token
     // tutor-service trusts, and land straight on the real instructor/student
     // app for this person's own tenant.
     const userid = await getOrAllocateUserId(platform.tenant_key, platform.issuer, payload.sub, identity.email);
+    // Launching from a course proves current membership in it (see lti_memberships).
+    if (identity.courseId) await setMembership(platform.tenant_key, platform.issuer, identity.courseId, payload.sub, true);
     const role = internalRole;
     const bridgeToken = signBridgeToken({
       tenant: platform.tenant_key,
@@ -147,6 +232,24 @@ router.post('/lti/launch', rateLimit('lti-launch', 30, 60 * 1000), async (req, r
       product: platform.product,
       courseId: identity.courseId,
       resourceLinkId: identity.resourceLinkId,
+      // Display-only (never used for authorization): lets tutor-service show
+      // this school's name and the LMS's own course title instead of a
+      // hard-coded pilot course.
+      courseTitle: identity.courseTitle,
+      courseLabel: identity.courseLabel,
+      tenantName: platform.tenant_name,
+      // What kind of activity this resource link is (from its Deep Linking /
+      // custom parameters), so tutor-service can send each grade to the right
+      // gradebook column: the course-wide Tutor Bot gets the overall score, a
+      // lecture's knowledge check gets that lecture's score, the video panel none.
+      // Analytics activities are never graded.
+      activity: platform.product === 'analytics'
+        ? { view: 'analytics', lectureId: null, pdfId: null }
+        : activityFromCustom(customClaim),
+      // How the LMS opened us: tutor-service shows "Back to course" (to
+      // returnUrl) when it's in its own window rather than the LMS's iframe.
+      returnUrl: presentation.returnUrl,
+      documentTarget: presentation.documentTarget,
     });
 
     const nrpsClaim = payload['https://purl.imsglobal.org/spec/lti-nrps/claim/namesroleservice'];
@@ -158,7 +261,7 @@ router.post('/lti/launch', rateLimit('lti-launch', 30, 60 * 1000), async (req, r
     // activity; harmless no-op otherwise.
     const agsClaim = payload['https://purl.imsglobal.org/spec/lti-ags/claim/endpoint'];
     if (agsClaim && identity.resourceLinkId) {
-      upsertAgsEndpoint(identity.resourceLinkId, {
+      await upsertAgsEndpoint(identity.resourceLinkId, {
         platformId: platform.id,
         tenantKey: platform.tenant_key,
         lineitemUrl: agsClaim.lineitem || null,
@@ -173,11 +276,27 @@ router.post('/lti/launch', rateLimit('lti-launch', 30, 60 * 1000), async (req, r
     // chosen, every subsequent resource-link launch of it carries that choice
     // back in the custom claim -- route straight into that lecture (students)
     // or its analytics (instructors) instead of the generic landing page.
-    const customClaim = payload['https://purl.imsglobal.org/spec/lti/claim/custom'] || {};
     const deepLinkedLectureId = customClaim.rennix_lecture_id || null;
     let destPath = isInstructor ? '/app/instructor' : '/app/home';
     if (deepLinkedLectureId) {
       destPath = isInstructor ? '/instructor/video-analytics' : `/lecture/${encodeURIComponent(deepLinkedLectureId)}`;
+    }
+    if (platform.product === 'tutor_bot') {
+      // A companion activity with custom parameter rennix_view=chat is what the
+      // LMS-side plugin (local_rennixtutorbot) frames next to lecture videos --
+      // it wants just the Tutor Bot chat panel, for every role, not a full app page.
+      if (customClaim.rennix_view === 'chat') destPath = '/widget/course/chat';
+      // A Deep-Linked "Knowledge check: <lecture>" (graded): students answer it;
+      // instructors land on that lecture's question review.
+      if (customClaim.rennix_view === 'knowledge_check' && deepLinkedLectureId) {
+        destPath = isInstructor
+          ? `/quiz/review?lecture=${encodeURIComponent(deepLinkedLectureId)}`
+          : `/widget/knowledge-check?lecture=${encodeURIComponent(deepLinkedLectureId)}&page=1`;
+      }
+      // A Deep-Linked PDF: the Rennix viewer with the Tutor Bot beside it.
+      if (/^\d+$/.test(String(customClaim.rennix_pdf_id || ''))) {
+        destPath = `/pdf/${customClaim.rennix_pdf_id}?lms=1&chat=1`;
+      }
     }
     const dest = new URL(destPath, APP_BASE_URL);
     dest.searchParams.set('t', bridgeToken);
@@ -190,7 +309,7 @@ router.post('/lti/launch', rateLimit('lti-launch', 30, 60 * 1000), async (req, r
     // launch, but there's no reason to fetch+push the whole roster on every
     // single student click when one instructor launch a day covers it.
     if (nrpsClaim && nrpsClaim.context_memberships_url && isInstructor) {
-      syncRosterViaNrps(platform, nrpsClaim.context_memberships_url).catch((err) => {
+      syncRosterViaNrps(platform, nrpsClaim.context_memberships_url, identity.courseId).catch((err) => {
         logAdminEvent('nrps_sync_failed', `tenant=${platform.tenant_key} error=${err.message}`.slice(0, 500), null);
       });
     }

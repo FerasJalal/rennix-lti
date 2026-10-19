@@ -1,11 +1,9 @@
-const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
 const http = require('http');
 const { test, before, after } = require('node:test');
 const assert = require('node:assert/strict');
 
-process.env.DB_PATH = path.join(os.tmpdir(), `lti-health-test-${crypto.randomBytes(6).toString('hex')}.db`);
 process.env.ADMIN_SECRET = 'test-admin-secret';
 process.env.SESSION_SECRET = 'test-session-secret';
 

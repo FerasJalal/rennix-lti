@@ -1,5 +1,8 @@
 const express = require('express');
-const { db, registerPlatform } = require('../db');
+const { db, registerPlatform, updatePlatform, getPlatformById } = require('../db');
+const { asyncRoute } = require('../util/asyncRoute');
+const { platformId } = require('./platforms');
+const { forgetPlatformJwks } = require('../lti/platformJwks');
 const { logAdminEvent } = require('../audit');
 const { escapeHtml } = require('../util/html');
 const { parseCookies, verifyAdminSession } = require('../security/tokens');
@@ -13,14 +16,14 @@ const router = express.Router();
 // uses), then makes one HTTP call to tutor-service's own admin endpoint to
 // set the school's OpenAI key -- that setting lives on tutor-service's side
 // (per-tenant database), not here. ----
-router.get('/admin', (req, res) => {
+router.get('/admin', asyncRoute(async (req, res) => {
   const cookies = parseCookies(req.headers.cookie);
   if (!verifyAdminSession(cookies.admin_session)) return res.redirect('/admin/login');
-  const registered = db.prepare(`
-    SELECT p.id, p.product, p.tenant_key, p.tenant_name, p.issuer, p.active, p.dynamic_registration, p.created_at,
+  const registered = await db.all(`
+    SELECT p.id, p.product, p.tenant_key, p.tenant_name, p.issuer, p.auth_token_url, p.active, p.dynamic_registration, p.created_at,
            (SELECT COUNT(*) FROM platform_deployments d WHERE d.platform_id = p.id) AS deployment_count
     FROM platforms p ORDER BY p.created_at DESC
-  `).all();
+  `);
 
   res.set('Content-Type', 'text/html').send(`<!doctype html>
 <html><head><meta charset="utf-8"><title>Onboard a school</title>
@@ -45,6 +48,9 @@ router.get('/admin', (req, res) => {
   .status.inactive { background:#f7e6e6; color:#a10f22; }
   .status.dynamic { background:#eef0ff; color:#3a3fd4; }
   .status.manual { background:#f2f4f6; color:#57606a; }
+  .status.warn { background:#fff4e0; color:#9a5b00; }
+  .rowlinks { display:flex; flex-direction:column; gap:4px; align-items:flex-start; }
+  .rowlinks a { color:#8a94a6; font-size:11px; }
   .rowaction { background:none; border:none; color:#8a94a6; font-size:11px; cursor:pointer; text-decoration:underline; padding:0; }
   .adddeploy { display:flex; gap:4px; align-items:center; }
   .adddeploy input { width:110px; padding:3px 6px; font-size:11px; border:1px solid #ccc; border-radius:4px; }
@@ -52,6 +58,7 @@ router.get('/admin', (req, res) => {
 </style></head>
 <body>
   <div class="signout">
+    <a href="/admin/keys">Signing keys</a>
     <a href="/admin/audit">Audit log</a>
     <form method="post" action="/admin/logout"><button type="submit">Sign out</button></form>
   </div>
@@ -81,8 +88,13 @@ router.get('/admin', (req, res) => {
         <input name="deploymentId" required>
         <label>Auth login URL</label>
         <input name="authLoginUrl" required>
+        <div class="hint">Moodle: "Authentication request URL" (&hellip;/mod/lti/auth.php)</div>
+        <label>Access token URL</label>
+        <input name="authTokenUrl" placeholder="https://their-lms.example.edu/mod/lti/token.php">
+        <div class="hint">Moodle: "Access token URL". Needed for roster sync and pushing grades to their gradebook -- launches work without it, those two don't.</div>
         <label>JWKS URL</label>
         <input name="jwksUrl" required>
+        <div class="hint">Moodle: "Public keyset URL" (&hellip;/mod/lti/certs.php)</div>
       </fieldset>
 
       <label>Their own OpenAI API key (optional)</label>
@@ -101,27 +113,29 @@ router.get('/admin', (req, res) => {
         <td>${escapeHtml(p.tenant_name)} (${escapeHtml(p.tenant_key)})</td>
         <td>${escapeHtml(p.issuer)}</td>
         <td><span class="status ${p.dynamic_registration ? 'dynamic' : 'manual'}">${p.dynamic_registration ? 'Dynamic' : 'Manual'}</span></td>
-        <td><span class="status ${p.active ? 'active' : 'inactive'}">${p.active ? 'Active' : 'Inactive'}</span></td>
+        <td><span class="status ${p.active ? 'active' : 'inactive'}">${p.active ? 'Active' : 'Inactive'}</span>
+          ${p.auth_token_url ? '' : '<br><span class="status warn" title="Roster sync and grade push need the LMS access token URL">No token URL</span>'}</td>
         <td>${p.deployment_count}
           <form class="adddeploy" method="post" action="/admin/platforms/${p.id}/deployments">
             <input name="deploymentId" placeholder="add deployment id" required>
             <button type="submit">Add</button>
           </form>
         </td>
-        <td><form method="post" action="/admin/platforms/${p.id}/${p.active ? 'deactivate' : 'reactivate'}">
+        <td class="rowlinks"><a href="/admin/platforms/${p.id}/edit">Edit</a>
+          <form method="post" action="/admin/platforms/${p.id}/${p.active ? 'deactivate' : 'reactivate'}">
           <button class="rowaction" type="submit">${p.active ? 'Deactivate' : 'Reactivate'}</button>
         </form></td>
       </tr>`).join('')}
     </table>
   </div>` : ''}
 </body></html>`);
-});
+}));
 
-router.post('/admin/onboard', requireAdmin, async (req, res) => {
-  const { tenantKey, tenantName, product, issuer, clientId, deploymentId, authLoginUrl, jwksUrl, openaiApiKey } = req.body;
+router.post('/admin/onboard', requireAdmin, asyncRoute(async (req, res) => {
+  const { tenantKey, tenantName, product, issuer, clientId, deploymentId, authLoginUrl, authTokenUrl, jwksUrl, openaiApiKey } = req.body;
 
   try {
-    registerPlatform({ product, tenantKey, tenantName, issuer, clientId, deploymentId, authLoginUrl, jwksUrl });
+    await registerPlatform({ product, tenantKey, tenantName, issuer, clientId, deploymentId, authLoginUrl, authTokenUrl, jwksUrl });
     logAdminEvent('platform_onboarded', `${product} / ${tenantKey}`, req);
   } catch (err) {
     return res.status(400).send(`Platform registration failed: ${escapeHtml(err.message)}`);
@@ -163,6 +177,62 @@ a{color:#d41128;}</style></head>
   </dl>
   <p><a href="/admin">&larr; Back</a></p>
 </div></body></html>`);
-});
+}));
+
+// ---- Edit an existing platform (typos, a missing token URL, an LMS that moved) ----
+const EDIT_PAGE_STYLE = `body{font-family:-apple-system,"Segoe UI",Roboto,Arial,sans-serif;background:#f7f8fa;margin:0;padding:32px 16px;}
+.card{max-width:560px;margin:0 auto;background:#fff;border:1px solid #e2e8f0;border-radius:12px;padding:24px;}
+h1{font-size:18px;margin:0 0 4px;}p.sub{color:#57606a;font-size:13px;margin:0 0 16px;}
+label{display:block;font-weight:700;font-size:13px;margin:14px 0 4px;}
+input{width:100%;box-sizing:border-box;padding:9px 10px;border:1px solid #ccc;border-radius:6px;font-size:13px;}
+input[readonly]{background:#f2f4f6;color:#57606a;}
+.hint{color:#8a94a6;font-size:12px;margin-top:4px;}.error{background:#fdecec;color:#a10f22;padding:10px;border-radius:6px;font-size:13px;}
+button{margin-top:20px;padding:10px 18px;border:none;border-radius:8px;background:#d41128;color:#fff;font-weight:700;cursor:pointer;}
+a{color:#8a94a6;font-size:13px;}`;
+
+function renderEditPage(p, error) {
+  const field = (label, name, value, hint, attrs = '') => `<label>${label}</label>
+    <input name="${name}" value="${escapeHtml(value || '')}" ${attrs}>${hint ? `<div class="hint">${hint}</div>` : ''}`;
+  return `<!doctype html><html><head><meta charset="utf-8"><title>Edit platform</title><style>${EDIT_PAGE_STYLE}</style></head>
+<body><div class="card">
+  <h1>Edit ${escapeHtml(p.tenant_name)} &mdash; ${escapeHtml(p.product)}</h1>
+  <p class="sub">Changes apply to the next launch. Existing users and history are kept.</p>
+  ${error ? `<p class="error">${escapeHtml(error)}</p>` : ''}
+  <form method="post" action="/admin/platforms/${p.id}/edit">
+    ${field('Tenant key', 'tenantKeyDisplay', p.tenant_key, 'Fixed: users and their history are stored under this key.', 'readonly')}
+    ${field('Tenant name', 'tenantName', p.tenant_name, '', 'required')}
+    ${field('Issuer', 'issuer', p.issuer, 'Moodle: "Platform ID"', 'required')}
+    ${field('Client ID', 'clientId', p.client_id, '', 'required')}
+    ${field('Auth login URL', 'authLoginUrl', p.auth_login_url, 'Moodle: "Authentication request URL"', 'required')}
+    ${field('Access token URL', 'authTokenUrl', p.auth_token_url, 'Moodle: "Access token URL". Leave blank to disable roster sync and grade push.')}
+    ${field('JWKS URL', 'jwksUrl', p.jwks_url, 'Moodle: "Public keyset URL"', 'required')}
+    <button type="submit">Save changes</button>
+  </form>
+  <p><a href="/admin">&larr; Back without saving</a></p>
+</div></body></html>`;
+}
+
+router.get('/admin/platforms/:id/edit', requireAdmin, asyncRoute(async (req, res) => {
+  if (platformId(req, res) === null) return;
+  const p = await getPlatformById(Number(req.params.id));
+  if (!p) return res.status(404).send('Platform not found.');
+  res.set('Content-Type', 'text/html').send(renderEditPage(p));
+}));
+
+router.post('/admin/platforms/:id/edit', requireAdmin, asyncRoute(async (req, res) => {
+  if (platformId(req, res) === null) return;
+  const existing = await getPlatformById(Number(req.params.id));
+  if (!existing) return res.status(404).send('Platform not found.');
+  const { tenantName, issuer, clientId, authLoginUrl, authTokenUrl, jwksUrl } = req.body;
+  try {
+    const { changed } = await updatePlatform(existing.id, { tenantName, issuer, clientId, authLoginUrl, authTokenUrl, jwksUrl });
+    if (changed.includes('jwks_url') || changed.includes('issuer')) forgetPlatformJwks(existing.id);
+    logAdminEvent('platform_edited', `platform_id=${existing.id} tenant=${existing.tenant_key} changed=${changed.join(',') || 'nothing'}`, req);
+    res.redirect('/admin');
+  } catch (err) {
+    res.status(400).set('Content-Type', 'text/html')
+      .send(renderEditPage({ ...existing, ...{ tenant_name: tenantName, issuer, client_id: clientId, auth_login_url: authLoginUrl, auth_token_url: authTokenUrl, jwks_url: jwksUrl } }, err.message));
+  }
+}));
 
 module.exports = { router };

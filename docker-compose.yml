@@ -11,8 +11,32 @@ services:
       LTI_BRIDGE_SECRET: ${LTI_BRIDGE_SECRET}
       TENANT_ADMIN_SECRET: ${TENANT_ADMIN_SECRET}
       KEY_ENCRYPTION_SECRET: ${KEY_ENCRYPTION_SECRET}
+      DATABASE_URL: postgres://rennix:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@postgres:5432/rennix_lti
+      KEY_ROTATION_DAYS: ${KEY_ROTATION_DAYS:-90}
+      KEY_RETIRED_GRACE_HOURS: ${KEY_RETIRED_GRACE_HOURS:-24}
+    depends_on:
+      postgres:
+        condition: service_healthy
     volumes:
+      # Only still mounted so a pre-Postgres lti.db can be migrated
+      # (see "Moving from SQLite" in the README); nothing new is written here.
       - lti_data:/data
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: rennix
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: rennix_lti
+    volumes:
+      - lti_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rennix -d rennix_lti"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
 
 volumes:
   lti_data:
+  lti_pgdata:
