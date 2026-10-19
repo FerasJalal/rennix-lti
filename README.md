@@ -147,6 +147,29 @@ behind roster sync and grade push) against `/lti/jwks`. Each key goes through fo
 
 Every rotation is written to the audit log (`tool_key_rotated`).
 
+## Operations
+
+**Backups.** `npm run backup -- --dest /backups/lti [--keep-days 14]` writes a `pg_dump`
+custom-format file plus a checksum manifest, verifies the archive, and prunes old dumps. Where
+`pg_dump` only exists inside the Postgres container, pass the command:
+`PG_DUMP="docker compose exec -T postgres pg_dump -U rennix rennix_lti" npm run backup -- --dest ...`.
+Restore with `pg_restore --clean --if-exists -d "$DATABASE_URL" <file>.dump`. Run it daily
+(cron) and copy the folder off the server; the user mappings in it are how students keep their
+history.
+
+**Monitoring.** `/health` checks the database. `GET /admin/health/summary?minutes=60`
+(admin) counts successful launches and each kind of failure per school (failed signature,
+deployment mismatch, browser check, grade push, roster sync...). `npm run monitor` checks both
+services' health and both summaries, and posts alerts to `ALERT_WEBHOOK_URL` (Slack, Teams or
+Discord); run it every few minutes from cron. Settings are listed at the top of
+`scripts/monitor.js`. Pair it with an external uptime check on `/health` and tutor-service's
+`/health/ready`, so an outage of the whole server is noticed too.
+
+**Data requests.** `GET /admin/data/user?tenant&userid` exports a person's LMS identity and
+memberships; `POST /admin/data/user/erase` removes them (a later launch gets a new user id);
+`POST /admin/data/school/erase` removes a school's registrations and people. tutor-service's
+`/admin/data/*` routes hold the rest of their data; do both.
+
 ## How a verified launch reaches the real app
 
 A verified launch mints a signed bridge token (`LTI_BRIDGE_SECRET`, shared with tutor-service —
