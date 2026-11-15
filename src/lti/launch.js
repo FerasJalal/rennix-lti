@@ -1,11 +1,10 @@
 const express = require('express');
 const { jwtVerify } = require('jose');
 const { db } = require('../db');
-const { getOrAllocateUserId, getPlatformById, isKnownDeployment, addDeployment, upsertAgsEndpoint, setMembership } = require('../db');
+const { getOrAllocateUserId, getPlatformById, isKnownDeployment, addDeployment, upsertAgsEndpoint, setMembership, createHandoffCode } = require('../db');
 const { logAdminEvent } = require('../audit');
 const { rateLimit } = require('../rateLimit');
 const { escapeHtml } = require('../util/html');
-const { signBridgeToken } = require('../security/tokens');
 const { mapLtiRolesToInternalRole, isInstructorRole } = require('./roles');
 const { getPlatformJwks } = require('./platformJwks');
 const { handleDeepLinkingRequest } = require('./deepLinking');
@@ -211,14 +210,16 @@ router.post('/lti/launch', rateLimit('lti-launch', 30, 60 * 1000), async (req, r
       ));
     }
 
-    // Hand off into the actual product: mint the signed bridge token
-    // tutor-service trusts, and land straight on the real instructor/student
-    // app for this person's own tenant.
+    // Hand off into the actual product: store the launch details behind a
+    // one-time code (src/lti/handoff.js) and land straight on the real
+    // instructor/student app for this person's own tenant. Only the code goes
+    // into the URL; tutor-service's server redeems it once, within 60 s.
     const userid = await getOrAllocateUserId(platform.tenant_key, platform.issuer, payload.sub, identity.email);
     // Launching from a course proves current membership in it (see lti_memberships).
     if (identity.courseId) await setMembership(platform.tenant_key, platform.issuer, identity.courseId, payload.sub, true);
     const role = internalRole;
-    const bridgeToken = signBridgeToken({
+    const handoffCode = await createHandoffCode({
+      aud: 'tutor-service',
       tenant: platform.tenant_key,
       userid,
       role,
@@ -299,7 +300,7 @@ router.post('/lti/launch', rateLimit('lti-launch', 30, 60 * 1000), async (req, r
       }
     }
     const dest = new URL(destPath, APP_BASE_URL);
-    dest.searchParams.set('t', bridgeToken);
+    dest.searchParams.set('c', handoffCode);
     if (deepLinkedLectureId && isInstructor) dest.searchParams.set('lecture_id', deepLinkedLectureId);
     res.redirect(303, dest.toString());
 

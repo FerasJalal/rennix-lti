@@ -3,7 +3,7 @@ process.env.LTI_BRIDGE_SECRET = 'test-bridge-secret';
 
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
-const { signAdminSession, verifyAdminSession, signBridgeToken, parseCookies } = require('../src/security/tokens');
+const { signAdminSession, verifyAdminSession, parseCookies } = require('../src/security/tokens');
 
 test('signAdminSession round-trips through verifyAdminSession', () => {
   const token = signAdminSession();
@@ -38,28 +38,6 @@ test('verifyAdminSession rejects malformed tokens without throwing', () => {
   assert.equal(verifyAdminSession(''), false);
   assert.equal(verifyAdminSession('not-a-real-token'), false);
   assert.equal(verifyAdminSession('a.b.c'), false);
-});
-
-test('signBridgeToken throws when LTI_BRIDGE_SECRET is not set', () => {
-  const original = process.env.LTI_BRIDGE_SECRET;
-  delete process.env.LTI_BRIDGE_SECRET;
-  delete require.cache[require.resolve('../src/config')];
-  delete require.cache[require.resolve('../src/security/tokens')];
-  const { signBridgeToken: signWithoutSecret } = require('../src/security/tokens');
-  assert.throws(() => signWithoutSecret({ foo: 'bar' }), /LTI_BRIDGE_SECRET is not set/);
-  process.env.LTI_BRIDGE_SECRET = original;
-});
-
-test('signBridgeToken produces a verifiable HMAC token', () => {
-  const crypto = require('crypto');
-  const token = signBridgeToken({ tenant: 'htu', userid: 1 });
-  const [body, sig] = token.split('.');
-  const expected = crypto.createHmac('sha256', process.env.LTI_BRIDGE_SECRET).update(body).digest('base64url');
-  assert.equal(sig, expected);
-  const payload = JSON.parse(Buffer.from(body, 'base64url').toString());
-  assert.equal(payload.tenant, 'htu');
-  assert.equal(payload.userid, 1);
-  assert.ok(payload.exp > Date.now());
 });
 
 test('parseCookies parses a simple cookie header', () => {

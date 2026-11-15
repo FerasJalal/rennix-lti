@@ -172,15 +172,26 @@ memberships; `POST /admin/data/user/erase` removes them (a later launch gets a n
 
 ## How a verified launch reaches the real app
 
-A verified launch mints a signed bridge token (`LTI_BRIDGE_SECRET`, shared with tutor-service —
-separate from block_criterio's `IDENTITY_SECRET`) and redirects straight to tutor-service's real
-`/app/instructor` or `/app/home`. tutor-service is multi-tenant as of the corresponding change
-there: each institution gets its own fully isolated database, resolved only from this signed
-token, never a client-suppliable parameter. LTI's own user identifier (`sub`, an opaque
+A verified launch stores its details behind a random one-time code and redirects straight to
+tutor-service's real `/app/instructor` or `/app/home` with only `?c=<code>` in the URL.
+tutor-service's server then redeems the code with `POST /lti/handoff/redeem` (Bearer
+`LTI_BRIDGE_SECRET`, shared with tutor-service — separate from block_criterio's `IDENTITY_SECRET`);
+it needs `RENNIX_LTI_URL` set to this service's address. A code works once and for 60 seconds, so a
+URL copied from history, a log or a `Referer` header signs nobody in, and the person's name and
+email never appear in a URL. (Until November 2026 the launch put a signed token, valid 8 hours, in
+the URL instead.) tutor-service is multi-tenant as of the corresponding change there: each
+institution gets its own fully isolated database, resolved only from the redeemed launch, never a
+client-suppliable parameter. LTI's own user identifier (`sub`, an opaque
 platform-chosen string) is mapped to a stable per-tenant integer id on first launch and reused on
 every later one; first-time users are auto-provisioned from the platform's own verified
 name/email/role claims, since there's no Moodle-style manual roster sync for institutions that
 connect this way.
+
+Email is never an identity key. The one exception is a migration aid for schools that used the
+Moodle-plugin path first (HTU): on someone's first LTI launch, their email may link them to an
+existing pre-LTI account (id below 100000) that no LTI identity has claimed yet, so they keep their
+history. Each such link is written to the audit log as `lti_user_linked_by_email`. An account made
+by an LTI launch, or one already linked, is never reached by email.
 
 `/lti/launched` (the old proof-of-concept identity page) is still there but no longer used by the
 real flow — harmless to keep as a debug page.
@@ -242,7 +253,8 @@ routes and business logic live in `src/`:
 
 - `src/config.js`, `src/db.js`, `src/audit.js` -- shared config, Postgres schema/access, admin audit
   logging.
-- `src/security/` -- token signing/verification (bridge token, admin session, this tool's own
+- `src/lti/handoff.js` -- redeems the one-time launch code for tutor-service.
+- `src/security/` -- token signing/verification (admin session, this tool's own
   RS256 signing keys and their rotation, `src/security/toolKeys.js`).
 - `src/rateLimit.js` -- fixed-window rate limiting, counted in Postgres so it holds across instances.
 - `src/lti/` -- the LTI protocol itself: login, launch/verification, Deep Linking, Dynamic

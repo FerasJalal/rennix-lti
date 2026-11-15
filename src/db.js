@@ -198,6 +198,15 @@ const SCHEMA = `
     updated_at BIGINT NOT NULL,
     PRIMARY KEY (tenant_key, platform_issuer, context_id, subject)
   );
+  -- One-time launch handoff codes (src/lti/handoff.js): the launch redirects
+  -- the browser to tutor-service with a random code, and tutor-service's
+  -- server redeems it here for the launch details. Single-use, 60 s; only a
+  -- hash of the code is kept.
+  CREATE TABLE IF NOT EXISTS lti_handoff_codes (
+    code_hash TEXT PRIMARY KEY,
+    payload TEXT NOT NULL,
+    expires_at BIGINT NOT NULL
+  );
   -- Fixed-window request counters shared by every instance (src/rateLimit.js).
   CREATE TABLE IF NOT EXISTS rate_limits (
     bucket TEXT PRIMARY KEY,
@@ -257,6 +266,29 @@ async function sweepExpiredStates() {
 // session (src/lti/dynamicRegistration.js).
 async function sweepExpiredRegistrationSessions() {
   await db.run('DELETE FROM lti_registration_sessions WHERE created_at < ?', [Date.now() - 10 * 60 * 1000]);
+}
+
+// ---- One-time launch handoff codes ----
+const HANDOFF_TTL_MS = 60 * 1000;
+const handoffHash = (code) => require('crypto').createHash('sha256').update(String(code || '')).digest('hex');
+
+// Stores the launch details and returns the code -- the only thing that goes
+// into the browser's URL. Never the details themselves (they include the
+// person's name and email).
+async function createHandoffCode(payload) {
+  await db.run('DELETE FROM lti_handoff_codes WHERE expires_at < ?', [Date.now()]);
+  const code = require('crypto').randomBytes(32).toString('base64url');
+  await db.run('INSERT INTO lti_handoff_codes (code_hash, payload, expires_at) VALUES (?, ?, ?)',
+    [handoffHash(code), JSON.stringify(payload), Date.now() + HANDOFF_TTL_MS]);
+  return code;
+}
+
+// Atomically deletes the code and returns its launch details, or null when it
+// is unknown, already used, or expired -- a code works exactly once.
+async function redeemHandoffCode(code) {
+  const row = (await db.run('DELETE FROM lti_handoff_codes WHERE code_hash = ? RETURNING payload, expires_at', [handoffHash(code)])).rows[0];
+  if (!row || Number(row.expires_at) < Date.now()) return null;
+  return JSON.parse(row.payload);
 }
 
 // ---- Platforms ----
@@ -454,16 +486,33 @@ async function mapUserId(tenantKey, issuer, subject, userid) {
   return findMappedUserId(tenantKey, issuer, subject);
 }
 
+// Ids at or above this are allocated by LTI launches. The counter below is
+// seeded with 100001 but returns next_userid - 1, so a school's first LTI user
+// gets 100000 -- the floor is that, not the seed.
+const FIRST_LTI_USERID = 100000;
+
 async function getOrAllocateUserId(tenantKey, issuer, subject, email) {
   const existing = await findMappedUserId(tenantKey, issuer, subject);
   if (existing) return existing;
 
+  // Email is display data the LMS user may be able to change, so it can only
+  // ever reach an account that predates LTI (ids below FIRST_LTI_USERID, from
+  // the Moodle-plugin path) and that no LTI identity has claimed yet. An
+  // account made by an LTI launch, or one already linked, is never handed to
+  // a second person who happens to show the same email.
   const matched = await findExistingUserIdByEmail(tenantKey, email);
-  if (matched) return mapUserId(tenantKey, issuer, subject, matched);
+  if (matched && Number(matched) < FIRST_LTI_USERID) {
+    const claimed = await db.one('SELECT 1 FROM lti_user_map WHERE tenant_key = ? AND userid = ?', [tenantKey, Number(matched)]);
+    if (!claimed) {
+      const linked = await mapUserId(tenantKey, issuer, subject, Number(matched));
+      require('./audit').logAdminEvent('lti_user_linked_by_email', `tenant=${tenantKey} userid=${linked} issuer=${issuer}`);
+      return linked;
+    }
+  }
 
   // Atomic per-tenant counter: next_userid holds the next free id.
   const { rows } = await db.run(
-    `INSERT INTO tenant_userid_seq (tenant_key, next_userid) VALUES (?, 100001)
+    `INSERT INTO tenant_userid_seq (tenant_key, next_userid) VALUES (?, ${FIRST_LTI_USERID + 1})
      ON CONFLICT (tenant_key) DO UPDATE SET next_userid = tenant_userid_seq.next_userid + 1
      RETURNING next_userid - 1 AS userid`,
     [tenantKey]
@@ -477,4 +526,5 @@ module.exports = {
   isKnownDeployment, addDeployment, getOrAllocateUserId, findExistingUserIdByEmail, findMappedUserId,
   setMembership, hasActiveMembership,
   upsertAgsEndpoint, getAgsLineItem, setAgsLineItemUrl,
+  createHandoffCode, redeemHandoffCode,
 };

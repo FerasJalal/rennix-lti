@@ -1,15 +1,9 @@
 const crypto = require('crypto');
-const { SESSION_SECRET, LTI_BRIDGE_SECRET } = require('../config');
+const { SESSION_SECRET } = require('../config');
 
-// The token tutor-service actually trusts to open the real app -- distinct
-// from signSessionToken below, which is this service's own internal-only
-// token for the proof-of-concept landing page.
-function signBridgeToken(payload) {
-  if (!LTI_BRIDGE_SECRET) throw new Error('LTI_BRIDGE_SECRET is not set');
-  const body = Buffer.from(JSON.stringify({ ...payload, exp: Date.now() + 8 * 60 * 60 * 1000 })).toString('base64url');
-  const sig = crypto.createHmac('sha256', LTI_BRIDGE_SECRET).update(body).digest('base64url');
-  return `${body}.${sig}`;
-}
+// The launch no longer hands tutor-service a signed identity token in the URL
+// (it was reusable for 8 hours): it hands it a one-time code that
+// tutor-service's server redeems once (src/lti/handoff.js).
 
 function signSessionToken(payload) {
   const body = Buffer.from(JSON.stringify({ ...payload, iat: Date.now() })).toString('base64url');
@@ -55,5 +49,5 @@ function parseCookies(header) {
 }
 
 module.exports = {
-  signBridgeToken, signSessionToken, signAdminSession, verifyAdminSession, parseCookies, ADMIN_SESSION_MAX_AGE_MS,
+  signSessionToken, signAdminSession, verifyAdminSession, parseCookies, ADMIN_SESSION_MAX_AGE_MS,
 };

@@ -18,7 +18,7 @@ process.env.APP_BASE_URL = 'https://app.test';
 delete process.env.TENANT_ADMIN_SECRET; // keeps getOrAllocateUserId/NRPS paths from making real network calls
 
 const { SignJWT, generateKeyPair, exportJWK } = require('jose');
-const { db, registerPlatform, getPlatform, setPlatformActive, addDeployment } = require('../src/db');
+const { db, registerPlatform, getPlatform, setPlatformActive, addDeployment, redeemHandoffCode } = require('../src/db');
 const app = require('../server');
 
 function listen(server) {
@@ -168,7 +168,8 @@ test('valid student launch redirects into the app with a bridge token', async ()
   assert.equal(res.statusCode, 303);
   const dest = new URL(res.headers.location);
   assert.equal(dest.origin + dest.pathname, 'https://app.test/app/home');
-  assert.ok(dest.searchParams.get('t'), 'expected a bridge token in the redirect');
+  assert.ok(dest.searchParams.get('c'), 'expected a one-time handoff code in the redirect');
+  assert.equal(dest.searchParams.get('t'), null, 'no signed identity token in the URL');
 });
 
 test('valid instructor launch redirects to the instructor app', async () => {
@@ -183,11 +184,10 @@ test('valid instructor launch redirects to the instructor app', async () => {
   assert.equal(dest.origin + dest.pathname, 'https://app.test/app/instructor');
 });
 
-test('the bridge token carries display-only course title/code and school name', async () => {
+test('the handoff carries display-only course title/code and school name', async () => {
   const { state, nonce } = await startLogin(tutorBotPlatform);
   const res = await launch(tutorBotPlatform, await buildIdToken(tutorBotPlatform, { nonce }), state);
-  const token = new URL(res.headers.location).searchParams.get('t');
-  const claims = JSON.parse(Buffer.from(token.split('.')[0], 'base64url').toString());
+  const claims = await redeemHandoffCode(new URL(res.headers.location).searchParams.get('c'));
   assert.equal(claims.courseTitle, 'Test Course');
   assert.equal(claims.courseLabel, 'TC101');
   assert.equal(claims.tenantName, 'Test Tenant');
@@ -201,12 +201,12 @@ test('a rennix_view=chat launch (video side panel) lands on the chat panel, for 
     assert.equal(res.statusCode, 303);
     const dest = new URL(res.headers.location);
     assert.equal(dest.origin + dest.pathname, 'https://app.test/widget/course/chat');
-    assert.ok(dest.searchParams.get('t'));
+    assert.ok(dest.searchParams.get('c'));
   }
 });
 
 test('Deep-Linked knowledge checks and PDFs route to their pages and carry the activity kind', async () => {
-  const bridgeClaims = (res) => JSON.parse(Buffer.from(new URL(res.headers.location).searchParams.get('t').split('.')[0], 'base64url').toString());
+  const bridgeClaims = (res) => redeemHandoffCode(new URL(res.headers.location).searchParams.get('c'));
   let { state, nonce } = await startLogin(tutorBotPlatform);
   let res = await launch(tutorBotPlatform, await buildIdToken(tutorBotPlatform, {
     nonce, custom: { rennix_view: 'knowledge_check', rennix_lecture_id: 'loops' },
@@ -214,7 +214,7 @@ test('Deep-Linked knowledge checks and PDFs route to their pages and carry the a
   let dest = new URL(res.headers.location);
   assert.equal(dest.pathname, '/widget/knowledge-check');
   assert.equal(dest.searchParams.get('lecture'), 'loops');
-  assert.deepEqual(bridgeClaims(res).activity, { view: 'knowledge_check', lectureId: 'loops', pdfId: null });
+  assert.deepEqual((await bridgeClaims(res)).activity, { view: 'knowledge_check', lectureId: 'loops', pdfId: null });
 
   ({ state, nonce } = await startLogin(tutorBotPlatform));
   res = await launch(tutorBotPlatform, await buildIdToken(tutorBotPlatform, {
@@ -227,17 +227,17 @@ test('Deep-Linked knowledge checks and PDFs route to their pages and carry the a
   dest = new URL(res.headers.location);
   assert.equal(dest.pathname, '/pdf/7');
   assert.equal(dest.searchParams.get('chat'), '1');
-  assert.deepEqual(bridgeClaims(res).activity, { view: 'pdf', lectureId: null, pdfId: 7 });
+  assert.deepEqual((await bridgeClaims(res)).activity, { view: 'pdf', lectureId: null, pdfId: 7 });
 
   ({ state, nonce } = await startLogin(tutorBotPlatform));
   res = await launch(tutorBotPlatform, await buildIdToken(tutorBotPlatform, { nonce }), state);
-  assert.deepEqual(bridgeClaims(res).activity, { view: null, lectureId: null, pdfId: null }, 'a plain launch is the course-wide activity');
+  assert.deepEqual((await bridgeClaims(res)).activity, { view: null, lectureId: null, pdfId: null }, 'a plain launch is the course-wide activity');
 
   ({ state, nonce } = await startLogin(analyticsPlatform));
   res = await launch(analyticsPlatform, await buildIdToken(analyticsPlatform, {
     nonce, roles: ['http://purl.imsglobal.org/vocab/lis/v2/membership#Instructor'],
   }), state);
-  assert.deepEqual(bridgeClaims(res).activity, { view: 'analytics', lectureId: null, pdfId: null }, 'Analytics is never a grade target');
+  assert.deepEqual((await bridgeClaims(res)).activity, { view: 'analytics', lectureId: null, pdfId: null }, 'Analytics is never a grade target');
 });
 
 test('rennix_view=chat is ignored for the Analytics product', async () => {
@@ -361,7 +361,7 @@ test('the platform JWKS endpoint is only fetched once per platform, not once per
 });
 
 // ---- The launch must finish in the browser that started it ----
-const tokenClaims = (res) => JSON.parse(Buffer.from(new URL(res.headers.location).searchParams.get('t').split('.')[0], 'base64url').toString());
+const tokenClaims = (res) => redeemHandoffCode(new URL(res.headers.location).searchParams.get('c'));
 const moodlePlatform = () => ({ ...tutorBotPlatform, auth_login_url: 'https://moodle.test/mod/lti/auth.php' });
 
 test('login sets a per-launch cookie that works inside the LMS iframe and only goes to /lti/launch', async () => {
@@ -415,7 +415,7 @@ test('the bridge token carries where "Back to course" goes and how the LMS opene
     nonce, presentation: { return_url: 'https://issuer.test/mod/lti/return.php?course=3', document_target: 'window' },
   }), state);
   assert.equal(res.statusCode, 303);
-  const claims = tokenClaims(res);
+  const claims = await tokenClaims(res);
   assert.equal(claims.returnUrl, 'https://issuer.test/mod/lti/return.php?course=3');
   assert.equal(claims.documentTarget, 'window');
 });
